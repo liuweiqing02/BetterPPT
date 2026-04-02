@@ -1,0 +1,9 @@
+﻿fastapi==0.116.1
+uvicorn==0.35.0
+sqlalchemy==2.0.43
+pydantic-settings==2.11.0
+redis==6.4.0
+python-multipart==0.0.20
+pymysql==1.1.2
+python-pptx==1.0.2
+pypdf==6.9.2

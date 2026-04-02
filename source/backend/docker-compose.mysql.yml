@@ -1,0 +1,28 @@
+﻿services:
+  mysql:
+    image: mysql:8.0.39
+    container_name: betterppt-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: change_me
+      MYSQL_DATABASE: betterppt
+      MYSQL_USER: betterppt
+      MYSQL_PASSWORD: betterppt_pass
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+00:00
+    ports:
+      - "3307:3306"
+    volumes:
+      - betterppt_mysql_data:/var/lib/mysql
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pchange_me"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  betterppt_mysql_data:
+

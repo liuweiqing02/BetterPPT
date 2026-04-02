@@ -1,0 +1,66 @@
+﻿# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.iml
+
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+coverage.xml
+htmlcov/
+.eggs/
+*.egg-info/
+build/
+dist/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+source/backend/.venv/
+
+# Runtime artifacts
+*.log
+*.out
+*.err
+*.pid
+*.sqlite
+*.sqlite3
+*.db
+source/backend/betterppt_*.db
+source/backend/tmp_*/
+source/backend/tmp_acceptance_logs/
+source/backend/tmp_acceptance_runs/
+source/backend/storage/
+storage/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+source/backend/.env
+*.pem
+*.key
+*.crt
+
+# Frontend
+node_modules/
+source/frontend/node_modules/
+
+# Large local sample files (enable selectively if needed)
+ref/*.pdf
+ref/*.ppt
+ref/*.pptx
+ref/*.doc
+ref/*.docx
