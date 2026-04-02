@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import sys
 import tempfile
 import unittest
@@ -21,13 +22,37 @@ if 'app.services' not in sys.modules:
 
 from app.services.template_asset_service import assetize_template_file, get_template_assets
 
+_GENERATED_REF_DIR: tempfile.TemporaryDirectory[str] | None = None
+
 
 def _find_reference_pptx() -> Path:
     root = Path(__file__).resolve().parents[4]
     candidates = sorted((root / 'ref').glob('*.pptx'))
-    if not candidates:
-        raise AssertionError('no reference pptx found under ref/')
-    return candidates[0]
+    if candidates:
+        return candidates[0]
+
+    # CI/public repos may not include private sample files under ref/.
+    # Build a tiny deterministic pptx fixture on the fly as a fallback.
+    global _GENERATED_REF_DIR
+    if _GENERATED_REF_DIR is None:
+        _GENERATED_REF_DIR = tempfile.TemporaryDirectory(prefix='betterppt-unit-ref-')
+        atexit.register(_GENERATED_REF_DIR.cleanup)
+        generated_path = Path(_GENERATED_REF_DIR.name) / 'generated_reference.pptx'
+        from pptx import Presentation
+
+        prs = Presentation()
+        cover = prs.slides.add_slide(prs.slide_layouts[0])
+        cover.shapes.title.text = 'BetterPPT Unit Template'
+        if len(cover.placeholders) > 1:
+            cover.placeholders[1].text = 'Auto-generated fallback template'
+
+        content = prs.slides.add_slide(prs.slide_layouts[1])
+        content.shapes.title.text = 'Content Layout'
+        if len(content.placeholders) > 1:
+            content.placeholders[1].text = 'bullet one\nbullet two'
+
+        prs.save(generated_path)
+    return Path(_GENERATED_REF_DIR.name) / 'generated_reference.pptx'
 
 
 class TemplateAssetServiceTestCase(unittest.TestCase):
