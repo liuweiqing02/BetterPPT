@@ -6,10 +6,12 @@ from datetime import datetime, timezone
 from random import randint
 from typing import Any
 
+from redis.exceptions import RedisError
 from sqlalchemy import asc, desc, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.constants import (
     ALLOWED_DETAIL_LEVELS,
     DETAIL_LEVEL_PAGE_RANGE,
@@ -27,7 +29,7 @@ from app.models.task_event import TaskEvent
 from app.models.task_step import TaskStep
 from app.services.event_service import add_task_event
 from app.services.file_service import delete_file
-from app.services.queue_service import cache_task_progress, enqueue_task, push_task_event_cache
+from app.services.queue_service import cache_task_progress, enqueue_task, get_redis_client, push_task_event_cache
 
 
 def generate_task_no() -> str:
@@ -86,6 +88,38 @@ def _estimate_page_count(detail_level: str) -> int:
     return (low + high) // 2
 
 
+def _check_create_task_rate_limit(user_id: int) -> None:
+    settings = get_settings()
+    limit = int(settings.rate_limit_create_task_per_minute or 0)
+    if limit <= 0:
+        return
+
+    client = get_redis_client()
+    if client is None:
+        return
+
+    key = f'rate_limit:create_task:{int(user_id)}'
+    try:
+        current = int(client.incr(key))
+        if current == 1:
+            client.expire(key, 60)
+    except RedisError:
+        return
+
+    if current > limit:
+        ttl = 60
+        try:
+            ttl = max(1, int(client.ttl(key)))
+        except Exception:
+            ttl = 60
+        raise AppException(
+            status_code=429,
+            code=1004,
+            message='create task rate limited',
+            data={'limit_per_minute': limit, 'retry_after_seconds': ttl},
+        )
+
+
 def create_task(
     db: Session,
     *,
@@ -100,6 +134,8 @@ def create_task(
     detail_level = detail_level.strip().lower()
     if detail_level not in ALLOWED_DETAIL_LEVELS:
         raise AppException(status_code=400, code=1001, message='invalid detail_level')
+
+    _check_create_task_rate_limit(user_id)
 
     _validate_task_files(
         db,

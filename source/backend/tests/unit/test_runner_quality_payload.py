@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+os.environ.setdefault('DATABASE_URL', 'sqlite+pysqlite:///:memory:')
 
 from app.core.constants import TaskStepCode
 from app.workers.runner import (
@@ -14,7 +17,7 @@ from app.workers.runner import (
 
 
 class RunnerQualityPayloadTestCase(unittest.TestCase):
-    def test_normalize_quality_payload_uses_plan_metrics_and_metric_v11(self) -> None:
+    def test_normalize_quality_payload_uses_plan_metrics_and_metric_v10(self) -> None:
         mapped_slide_plan = [
             {
                 'page_no': 1,
@@ -82,7 +85,7 @@ class RunnerQualityPayloadTestCase(unittest.TestCase):
             attempt_no=1,
         )
 
-        self.assertEqual(payload['metric_version'], 'v1.1')
+        self.assertEqual(payload['metric_version'], 'v1.0')
         self.assertEqual(payload['evaluated_pages'], 2)
         self.assertAlmostEqual(payload['editable_text_ratio'], 0.5, places=4)
         self.assertAlmostEqual(payload['locked_page_ratio'], 0.5, places=4)

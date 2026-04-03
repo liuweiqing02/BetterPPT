@@ -4,6 +4,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_DEFAULT_VISION_MODEL = 'google/vit-base-patch16-224-in21k'
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -34,11 +36,20 @@ class Settings(BaseSettings):
     llm_api_base: str = Field(default='https://api.openai.com/v1', alias='LLM_API_BASE')
     llm_api_key: str = Field(default='', alias='LLM_API_KEY')
     llm_model: str = Field(default='gpt-4.1-mini', alias='LLM_MODEL')
+    llm_request_timeout_seconds: int = Field(default=15, alias='LLM_REQUEST_TIMEOUT_SECONDS')
+    llm_request_max_retries: int = Field(default=1, alias='LLM_REQUEST_MAX_RETRIES')
+    template_vision_model: str = Field(default=_DEFAULT_VISION_MODEL, alias='BETTERPPT_TEMPLATE_VISION_MODEL')
+    template_vision_model_path: str = Field(default='', alias='BETTERPPT_TEMPLATE_VISION_MODEL_PATH')
+    template_vision_cache_dir: str = Field(default='', alias='BETTERPPT_TEMPLATE_VISION_CACHE_DIR')
 
     storage_provider: str = Field(default='local', alias='STORAGE_PROVIDER')
     local_storage_root: str = 'storage'
     upload_subdir: str = 'uploads'
     result_subdir: str = 'results'
+    signed_url_secret: str = Field(default='dev_signed_url_secret', alias='SIGNED_URL_SECRET')
+    signed_url_ttl_seconds: int = Field(default=3600, alias='SIGNED_URL_TTL_SECONDS')
+
+    rate_limit_create_task_per_minute: int = Field(default=30, alias='RATE_LIMIT_CREATE_TASK_PER_MINUTE')
 
     auth_default_user_id: int = 1
 

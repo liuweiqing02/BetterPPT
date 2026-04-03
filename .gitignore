@@ -43,6 +43,7 @@ source/backend/tmp_*/
 source/backend/tmp_acceptance_logs/
 source/backend/tmp_acceptance_runs/
 source/backend/storage/
+source/backend/models/
 storage/
 
 # Environment / secrets

@@ -39,6 +39,7 @@ from app.services.event_service import add_task_event
 from app.services.layout_service import apply_template_llm_suggestions, map_slide_plan_to_template
 from app.services.llm_service import call_chat_completions
 from app.services.file_service import _default_retention_expire_at
+from app.services.pdf_parse_service import parse_pdf_document
 from app.services.pptx_service import PPTXGenerationError, generate_pptx_from_plan
 from app.services.queue_service import (
     ack_stream_event,
@@ -95,6 +96,43 @@ def _default_step_input(task: Task, step_code: str) -> dict:
         'rag_enabled': bool(task.rag_enabled),
         'step_code': step_code,
     }
+
+
+def _infer_step_audit_fields(step_code: str, output_json: dict[str, Any]) -> tuple[bool, bool, str | None]:
+    analysis_source = str(output_json.get('analysis_source') or '').strip().lower()
+    plan_source = str(output_json.get('plan_source') or '').strip().lower()
+    generation_source = str(output_json.get('generation_source') or '').strip().lower()
+    query_source = str(output_json.get('query_source') or '').strip().lower()
+    llm_used = bool(output_json.get('llm_usage')) or bool(output_json.get('llm_enhanced'))
+    llm_used = llm_used or analysis_source.endswith('_llm') or plan_source == 'llm' or generation_source == 'llm' or query_source == 'llm'
+    fallback_reason = output_json.get('fallback_reason')
+
+    fallback_used = bool(output_json.get('fallback_used'))
+    fallback_used = fallback_used or analysis_source in {'parse_pdf_fallback', 'rag_fallback', 'self_correct_service'}
+    fallback_used = fallback_used or analysis_source == 'runner_fallback'
+    fallback_used = fallback_used or plan_source == 'mock_fallback'
+    fallback_used = fallback_used or generation_source == 'rule_based_from_plan'
+    fallback_used = fallback_used or (analysis_source == 'slot_mapping_service' and bool(output_json.get('llm_error')))
+    fallback_used = fallback_used or (query_source == 'rule' and bool(output_json.get('llm_error')))
+    fallback_used = fallback_used or str(output_json.get('parse_status') or '').strip().lower() in {'fallback', 'partial_fallback'}
+    fallback_used = fallback_used or bool(output_json.get('analysis_warnings'))
+    if fallback_used and fallback_reason is None and output_json.get('llm_error'):
+        fallback_reason = output_json.get('llm_error')
+
+    return llm_used, fallback_used, fallback_reason
+
+
+def _attach_step_audit_fields(step_code: str, output_json: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(output_json, dict):
+        return output_json
+
+    llm_used, fallback_used, fallback_reason = _infer_step_audit_fields(step_code, output_json)
+    output_json.setdefault('llm_used', llm_used)
+    output_json.setdefault('fallback_used', fallback_used)
+    if fallback_reason is not None and output_json.get('fallback_reason') is None:
+        output_json['fallback_reason'] = fallback_reason
+    output_json.setdefault('fallback_reason', None)
+    return output_json
 
 
 def _extract_keywords_from_text(text: str, limit: int = 10) -> list[str]:
@@ -254,10 +292,150 @@ def _load_existing_step_output(
     return step.output_json
 
 
+def _build_parse_pdf_step_output(task: Task, source_file: File) -> tuple[dict[str, Any], bool]:
+    settings = get_settings()
+    source_path = settings.storage_root_path / source_file.storage_path
+    if not source_path.exists():
+        fallback = _mock_step_output(task, TaskStepCode.PARSE_PDF)
+        fallback['analysis_source'] = 'parse_pdf_fallback'
+        fallback['fallback_reason'] = 'source file missing'
+        fallback['llm_used'] = False
+        fallback['fallback_used'] = True
+        return fallback, True
+
+    parse_assets_dir = settings.storage_root_path / settings.result_subdir / str(task.user_id) / task.task_no / 'parsed_assets'
+    try:
+        parsed = parse_pdf_document(
+            source_path,
+            image_output_dir=parse_assets_dir,
+            max_pages=80,
+            max_images=48,
+            max_tables=48,
+        )
+    except Exception as exc:
+        logger.warning('parse pdf failed, fallback mock used: %s', exc)
+        fallback = _mock_step_output(task, TaskStepCode.PARSE_PDF)
+        fallback['analysis_source'] = 'parse_pdf_fallback'
+        fallback['fallback_reason'] = str(exc)
+        fallback['llm_used'] = False
+        fallback['fallback_used'] = True
+        return fallback, True
+
+    llm_usage: dict[str, Any] | None = None
+    llm_error = None
+    try:
+        llm_refine_output, llm_meta = _call_document_parse_llm(
+            task=task,
+            source_file=source_file,
+            parsed=parsed,
+        )
+        llm_sections = llm_refine_output.get('sections')
+        if isinstance(llm_sections, list):
+            normalized_sections: list[dict[str, Any]] = []
+            for idx, section in enumerate(llm_sections, start=1):
+                if not isinstance(section, dict):
+                    continue
+                title = _coerce_text(
+                    section.get('title') or section.get('name') or section.get('heading'),
+                    default=f'Section {idx}',
+                )
+                try:
+                    page = int(section.get('page') or section.get('page_no') or section.get('source_page') or idx)
+                except Exception:
+                    page = idx
+                normalized_sections.append({'title': title, 'page': max(1, page)})
+            if normalized_sections:
+                parsed['sections'] = normalized_sections
+
+        llm_key_facts = llm_refine_output.get('key_facts') or llm_refine_output.get('facts')
+        if isinstance(llm_key_facts, list):
+            normalized_facts = [_coerce_text(item) for item in llm_key_facts if _coerce_text(item)]
+            if normalized_facts:
+                parsed['key_facts'] = normalized_facts[:20]
+
+        llm_evidence = llm_refine_output.get('evidence_spans') or llm_refine_output.get('evidence')
+        if isinstance(llm_evidence, list):
+            normalized_evidence: list[dict[str, Any]] = []
+            for idx, span in enumerate(llm_evidence, start=1):
+                if not isinstance(span, dict):
+                    continue
+                text = _coerce_text(span.get('text') or span.get('excerpt') or span.get('quote'))
+                if not text:
+                    continue
+                try:
+                    page = int(span.get('page') or span.get('source_page') or 0)
+                except Exception:
+                    page = 0
+                normalized_evidence.append({'page': max(1, page or idx), 'text': text[:280]})
+            if normalized_evidence:
+                parsed['evidence_spans'] = normalized_evidence[:24]
+
+        doc_summary = _coerce_text(llm_refine_output.get('doc_summary') or llm_refine_output.get('summary'))
+        if doc_summary:
+            parsed['doc_summary'] = doc_summary
+
+        llm_usage = llm_meta.get('usage') if isinstance(llm_meta, dict) else None
+        parsed['analysis_source'] = 'parse_pdf_llm'
+    except Exception as exc:
+        llm_error = str(exc)
+        logger.warning('parse pdf llm refine failed, keep parser output: %s', exc)
+        parsed['analysis_source'] = 'pdf_parse_service'
+
+    parsed['source_file_id'] = source_file.id
+    parsed['source_filename'] = source_file.filename
+    parsed['source_path'] = str(source_path)
+    parsed['image_count'] = len(parsed.get('images') or [])
+    parsed['table_count'] = len(parsed.get('tables') or [])
+    parsed['analysis_source'] = parsed.get('analysis_source') or 'pdf_parse_service'
+    parsed['llm_usage'] = llm_usage
+    parsed['llm_error'] = llm_error
+    parsed['llm_used'] = bool(llm_usage)
+    parsed['fallback_used'] = False
+    parsed['fallback_reason'] = None
+    return parsed, False
+
+
 def _build_rag_step_output(task: Task, source_file: File) -> tuple[dict[str, Any], bool]:
     source_text, fallback_used, source_debug = _read_source_text(source_file)
     fallback_keywords = _extract_keywords_from_text(source_text)
-    query = build_query(task.user_prompt if task.rag_enabled else '', fallback_keywords)
+    rule_query = build_query(task.user_prompt if task.rag_enabled else '', fallback_keywords)
+    query = rule_query
+    query_source = 'rule'
+    topic_weights: dict[str, float] = {}
+    llm_usage: dict[str, Any] | None = None
+    llm_error = None
+    source_excerpt = source_text[:_LLM_SOURCE_CHAR_LIMIT]
+    try:
+        llm_rag_output, llm_meta = _call_rag_retrieve_llm(
+            task=task,
+            source_excerpt=source_excerpt,
+            fallback_keywords=fallback_keywords,
+            rule_query=rule_query,
+        )
+        llm_query = _coerce_text(llm_rag_output.get('query') or llm_rag_output.get('retrieval_query'))
+        if llm_query:
+            query = llm_query
+            query_source = 'llm'
+
+        raw_weights = llm_rag_output.get('topic_weights')
+        if isinstance(raw_weights, dict):
+            normalized_weights: dict[str, float] = {}
+            for key, value in raw_weights.items():
+                topic = _coerce_text(key)
+                if not topic:
+                    continue
+                try:
+                    score = float(value)
+                except Exception:
+                    continue
+                normalized_weights[topic] = round(max(0.0, min(score, 1.0)), 4)
+            topic_weights = normalized_weights
+
+        llm_usage = llm_meta.get('usage') if isinstance(llm_meta, dict) else None
+    except Exception as exc:
+        llm_error = str(exc)
+        logger.warning('rag retrieve llm failed, fallback rule query used: %s', exc)
+
     chunks = chunk_document_text(source_text, chunk_size=400, overlap=60)
     rag_output = retrieve_chunks(chunks, query, top_k=5)
     rag_output.update(
@@ -270,6 +448,16 @@ def _build_rag_step_output(task: Task, source_file: File) -> tuple[dict[str, Any
             'binary_like': source_debug['binary_like'],
             'chunk_count': len(chunks),
             'fallback_text_used': fallback_used,
+            'analysis_source': 'rag_llm' if query_source == 'llm' else 'rag_service',
+            'query_source': query_source,
+            'query': query,
+            'rule_query': rule_query,
+            'topic_weights': topic_weights or rag_output.get('topic_weights') or {},
+            'llm_usage': llm_usage,
+            'llm_error': llm_error,
+            'llm_used': bool(llm_usage),
+            'fallback_used': bool(llm_error),
+            'fallback_reason': llm_error,
         }
     )
     return rag_output, fallback_used
@@ -281,13 +469,52 @@ def _build_self_correct_step_output(task: Task, step_outputs: dict[str, dict[str
     generate_output = step_outputs.get(TaskStepCode.GENERATE_SLIDES) or {}
     slide_plan = plan_output.get('slide_plan') or []
     edit_ops = generate_output.get('edit_ops') or []
-    result = run_self_correct(slide_plan=slide_plan, edit_ops=edit_ops, detail_level=task.detail_level)
     base_mapped_slide_plan = (
         map_output.get('mapped_slide_plan')
         or generate_output.get('mapped_slide_plan')
         or slide_plan
         or []
     )
+    result = run_self_correct(slide_plan=slide_plan, edit_ops=edit_ops, detail_level=task.detail_level)
+    llm_usage: dict[str, Any] | None = None
+    try:
+        raw_llm_output, llm_meta = _call_self_correct_llm(
+            task=task,
+            slide_plan=base_mapped_slide_plan,
+            slot_fill_plan=map_output.get('slot_fill_plan') or generate_output.get('slot_fill_plan') or [],
+            edit_ops=edit_ops,
+        )
+        llm_fix_ops = _normalize_llm_fix_ops(raw_llm_output.get('fix_ops') or raw_llm_output.get('applied_fix_ops'))
+        if llm_fix_ops:
+            result['fix_ops'] = llm_fix_ops
+
+        llm_quality_report = raw_llm_output.get('quality_report')
+        if isinstance(llm_quality_report, dict):
+            merged_quality_report = dict(result.get('quality_report') or {})
+            merged_quality_report.update(llm_quality_report)
+            result['quality_report'] = merged_quality_report
+
+        retry_recommended = raw_llm_output.get('retry_recommended')
+        if isinstance(retry_recommended, bool):
+            result['retry_recommended'] = retry_recommended
+
+        reason_code = _coerce_text(raw_llm_output.get('reason_code') or raw_llm_output.get('fallback_reason'))
+        if reason_code:
+            result['reason_code'] = reason_code
+
+        llm_usage = llm_meta.get('usage') if isinstance(llm_meta, dict) else None
+        result['analysis_source'] = 'self_correct_llm'
+        result['llm_usage'] = llm_usage
+        result['llm_used'] = True
+        result['fallback_used'] = False
+        result['fallback_reason'] = None
+    except Exception as exc:
+        logger.warning('self correct llm failed, fallback rule-based output used: %s', exc)
+        result['analysis_source'] = 'self_correct_service'
+        result['llm_used'] = False
+        result['fallback_used'] = True
+        result['fallback_reason'] = str(exc)
+
     corrected_slide_plan = _apply_fix_ops_to_mapped_slide_plan(
         base_mapped_slide_plan,
         result.get('fix_ops') or [],
@@ -545,6 +772,112 @@ def _to_bullet_list(value: Any) -> list[str]:
     return [str(value).strip()] if str(value).strip() else []
 
 
+def _overflow_policy(detail_level: str) -> dict[str, int]:
+    level = (detail_level or 'balanced').strip().lower()
+    if level == 'concise':
+        return {'max_bullets': 4, 'max_chars': 260, 'max_bullet_chars': 88}
+    if level == 'detailed':
+        return {'max_bullets': 8, 'max_chars': 580, 'max_bullet_chars': 150}
+    return {'max_bullets': 6, 'max_chars': 420, 'max_bullet_chars': 120}
+
+
+def _summarize_bullet_text(text: str, max_chars: int) -> tuple[str, bool]:
+    value = _coerce_text(text)
+    if len(value) <= max_chars:
+        return value, False
+    cut = value[: max(0, max_chars - 1)].rstrip()
+    if not cut:
+        return value[:max_chars], True
+    return f'{cut}…', True
+
+
+def _split_bullets_by_policy(bullets: list[str], policy: dict[str, int]) -> tuple[list[list[str]], int]:
+    max_bullets = int(policy.get('max_bullets') or 6)
+    max_chars = int(policy.get('max_chars') or 420)
+    max_bullet_chars = int(policy.get('max_bullet_chars') or 120)
+
+    normalized: list[str] = []
+    summary_count = 0
+    for bullet in bullets:
+        summarized, changed = _summarize_bullet_text(bullet, max_bullet_chars)
+        normalized.append(summarized)
+        if changed:
+            summary_count += 1
+
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_chars = 0
+    for bullet in normalized:
+        bullet_len = len(bullet)
+        exceeds_count = len(current) >= max_bullets
+        exceeds_chars = current_chars + bullet_len > max_chars and bool(current)
+        if exceeds_count or exceeds_chars:
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.append(bullet)
+        current_chars += bullet_len
+    if current:
+        chunks.append(current)
+    if not chunks:
+        chunks = [normalized[:max_bullets] or ['Key facts']]
+    return chunks, summary_count
+
+
+def _apply_text_overflow_strategy(mapped_slide_plan: list[dict[str, Any]], detail_level: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    if not mapped_slide_plan:
+        return [], {'split_pages': 0, 'summary_applied': 0, 'font_scale_applied': 0}
+
+    policy = _overflow_policy(detail_level)
+    result: list[dict[str, Any]] = []
+    split_pages = 0
+    summary_applied = 0
+    font_scale_applied = 0
+
+    for idx, slide in enumerate(mapped_slide_plan, start=1):
+        if not isinstance(slide, dict):
+            continue
+        bullets = _to_bullet_list(slide.get('bullets'))
+        title = _coerce_text(slide.get('title') or slide.get('heading') or slide.get('page_title') or f'Page {idx}')
+        if not bullets:
+            bullets = ['Key facts', 'Insights', 'Recommendations']
+
+        chunks, summarized_count = _split_bullets_by_policy(bullets, policy)
+        summary_applied += summarized_count
+
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            cloned = deepcopy(slide)
+            cloned['bullets'] = chunk
+            if chunk_index == 1:
+                cloned['title'] = title
+            else:
+                cloned['title'] = f'{title} (Continued {chunk_index})'
+                # Split page priority: continuation pages are text-first, avoid duplicating heavy assets.
+                cloned['tables'] = []
+                cloned['images'] = []
+                split_pages += 1
+
+            total_chars = sum(len(item) for item in chunk)
+            if total_chars > int(policy.get('max_chars') or 420):
+                style_tokens = cloned.get('style_tokens_json')
+                if not isinstance(style_tokens, dict):
+                    style_tokens = {}
+                    cloned['style_tokens_json'] = style_tokens
+                current_scale = float(style_tokens.get('font_size_scale') or 1.0)
+                style_tokens['font_size_scale'] = min(current_scale, 0.92)
+                font_scale_applied += 1
+            result.append(cloned)
+
+    for page_no, slide in enumerate(result, start=1):
+        slide['page_no'] = page_no
+
+    return result, {
+        'split_pages': split_pages,
+        'summary_applied': summary_applied,
+        'font_scale_applied': font_scale_applied,
+    }
+
+
 def _build_default_slide_plan(page_count: int) -> list[dict[str, Any]]:
     slides: list[dict[str, Any]] = []
     for page_no in range(1, page_count + 1):
@@ -645,6 +978,9 @@ def _build_plan_slides_step_output(
             'page_count_estimated': len(slide_plan),
             'plan_source': 'llm',
             'llm_usage': result.usage,
+            'llm_used': True,
+            'fallback_used': False,
+            'fallback_reason': None,
             'source_text_chars': source_debug.get('source_text_chars'),
             'fallback_text_used': fallback_used,
             'rag_context_count': len(rag_context),
@@ -656,6 +992,8 @@ def _build_plan_slides_step_output(
         fallback['fallback_reason'] = str(exc)
         fallback['source_text_chars'] = source_debug.get('source_text_chars')
         fallback['fallback_text_used'] = fallback_used
+        fallback['llm_used'] = False
+        fallback['fallback_used'] = True
         return fallback, True
 
 
@@ -707,6 +1045,56 @@ def _build_generate_slides_step_output(
         mapping = map_slide_plan_to_template(slide_plan=slide_plan, template_pages=template_pages)
         mapped_slide_plan = mapping.get('mapped_slide_plan') or []
 
+    rule_based_edit_ops: list[dict[str, Any]] = []
+    for idx, slide in enumerate(mapped_slide_plan, start=1):
+        page_no = int(slide.get('page_no') or idx)
+        title = str(slide.get('title') or f'Page {page_no}').strip()
+        bullets = _to_bullet_list(slide.get('bullets'))
+        if not bullets:
+            bullets = ['Key facts', 'Insights', 'Recommendations']
+
+        rule_based_edit_ops.append(
+            {
+                'op': 'replace_title',
+                'page_no': page_no,
+                'value': title,
+                'page_function': slide.get('page_function'),
+                'cluster_label': slide.get('cluster_label'),
+            }
+        )
+        rule_based_edit_ops.append(
+            {
+                'op': 'replace_bullets',
+                'page_no': page_no,
+                'value': bullets[:6],
+                'layout_schema_json': slide.get('layout_schema_json'),
+                'style_tokens_json': slide.get('style_tokens_json'),
+            }
+        )
+        tables = slide.get('tables') or []
+        images = slide.get('images') or []
+        if tables:
+            rule_based_edit_ops.append(
+                {
+                    'op': 'render_tables',
+                    'page_no': page_no,
+                    'count': len(tables),
+                    'slot_keys': [str(item.get('slot_key') or '') for item in tables],
+                }
+            )
+        if images:
+            rule_based_edit_ops.append(
+                {
+                    'op': 'render_images',
+                    'page_no': page_no,
+                    'count': len(images),
+                    'slot_keys': [str(item.get('slot_key') or '') for item in images],
+                }
+            )
+
+    generation_source = 'rule_based_from_plan'
+    llm_usage: dict[str, Any] | None = None
+    llm_error: str | None = None
     analyze_output = step_outputs.get(TaskStepCode.ANALYZE_TEMPLATE) or {}
     raw_llm_suggestions = []
     if isinstance(analyze_output, dict):
@@ -729,62 +1117,107 @@ def _build_generate_slides_step_output(
         slot_fill_plan=map_output.get('slot_fill_plan') or [],
     )
 
-    edit_ops: list[dict[str, Any]] = []
-    for idx, slide in enumerate(mapped_slide_plan, start=1):
-        page_no = int(slide.get('page_no') or idx)
-        title = str(slide.get('title') or f'Page {page_no}').strip()
-        bullets = _to_bullet_list(slide.get('bullets'))
-        if not bullets:
-            bullets = ['Key facts', 'Insights', 'Recommendations']
+    try:
+        raw_llm_output, llm_meta = _call_generate_slides_llm(
+            task=task,
+            mapped_slide_plan=mapped_slide_plan,
+            slot_fill_plan=map_output.get('slot_fill_plan') or [],
+        )
+        llm_edit_ops = raw_llm_output.get('edit_ops') or raw_llm_output.get('ops')
+        if isinstance(llm_edit_ops, list):
+            edit_ops = [item for item in llm_edit_ops if isinstance(item, dict)]
+        else:
+            edit_ops = []
 
-        edit_ops.append(
-            {
-                'op': 'replace_title',
-                'page_no': page_no,
-                'value': title,
-                'page_function': slide.get('page_function'),
-                'cluster_label': slide.get('cluster_label'),
-            }
-        )
-        edit_ops.append(
-            {
-                'op': 'replace_bullets',
-                'page_no': page_no,
-                'value': bullets[:6],
-                'layout_schema_json': slide.get('layout_schema_json'),
-                'style_tokens_json': slide.get('style_tokens_json'),
-            }
-        )
-        tables = slide.get('tables') or []
-        images = slide.get('images') or []
-        if tables:
-            edit_ops.append(
+        llm_mapped_slide_plan = raw_llm_output.get('mapped_slide_plan') or raw_llm_output.get('slide_plan')
+        if isinstance(llm_mapped_slide_plan, list):
+            llm_by_page: dict[int, dict[str, Any]] = {}
+            for item in llm_mapped_slide_plan:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    page_no = int(item.get('page_no') or item.get('slide_no') or 0)
+                except Exception:
+                    page_no = 0
+                if page_no > 0:
+                    llm_by_page[page_no] = item
+
+            merged_plan: list[dict[str, Any]] = []
+            for idx, slide in enumerate(mapped_slide_plan, start=1):
+                page_no = int(slide.get('page_no') or idx)
+                merged = dict(slide)
+                override = llm_by_page.get(page_no)
+                if override:
+                    for key in (
+                        'title',
+                        'bullets',
+                        'page_function',
+                        'cluster_label',
+                        'template_page_no',
+                        'layout_schema_json',
+                        'style_tokens_json',
+                        'tables',
+                        'images',
+                    ):
+                        value = override.get(key)
+                        if value not in (None, '', []):
+                            merged[key] = value
+                merged_plan.append(merged)
+            mapped_slide_plan = merged_plan
+
+        if not edit_ops:
+            edit_ops = rule_based_edit_ops
+        generation_source = 'llm'
+        llm_usage = llm_meta.get('usage') if isinstance(llm_meta, dict) else None
+    except Exception as exc:
+        llm_error = str(exc)
+        logger.warning('generate slides llm failed, fallback rule-based output used: %s', exc)
+        edit_ops = rule_based_edit_ops
+        generation_source = 'rule_based_from_plan'
+
+    mapped_slide_plan, text_overflow_stats = _apply_text_overflow_strategy(mapped_slide_plan, task.detail_level)
+    if text_overflow_stats.get('split_pages'):
+        # Rebuild rule-based ops on split pages to keep export edits aligned with final page structure.
+        rebuilt_ops: list[dict[str, Any]] = []
+        for idx, slide in enumerate(mapped_slide_plan, start=1):
+            page_no = int(slide.get('page_no') or idx)
+            title = str(slide.get('title') or f'Page {page_no}').strip()
+            bullets = _to_bullet_list(slide.get('bullets')) or ['Key facts', 'Insights', 'Recommendations']
+            rebuilt_ops.append(
                 {
-                    'op': 'render_tables',
+                    'op': 'replace_title',
                     'page_no': page_no,
-                    'count': len(tables),
-                    'slot_keys': [str(item.get('slot_key') or '') for item in tables],
+                    'value': title,
+                    'page_function': slide.get('page_function'),
+                    'cluster_label': slide.get('cluster_label'),
                 }
             )
-        if images:
-            edit_ops.append(
+            rebuilt_ops.append(
                 {
-                    'op': 'render_images',
+                    'op': 'replace_bullets',
                     'page_no': page_no,
-                    'count': len(images),
-                    'slot_keys': [str(item.get('slot_key') or '') for item in images],
+                    'value': bullets[:8],
+                    'layout_schema_json': slide.get('layout_schema_json'),
+                    'style_tokens_json': slide.get('style_tokens_json'),
                 }
             )
+        edit_ops = rebuilt_ops
 
     return {
         'edit_ops': edit_ops,
         'page_count': len(mapped_slide_plan),
-        'generation_source': 'rule_based_from_plan',
+        'generation_source': generation_source,
         'mapping_mode': mapping.get('mapping_mode'),
         'template_page_count': mapping.get('template_page_count'),
         'mapped_slide_plan': mapped_slide_plan,
         'llm_suggestions_total': llm_overlay.get('suggestions_total', 0),
         'llm_suggestions_applied': llm_overlay.get('suggestions_applied', 0),
+        'llm_usage': llm_usage,
+        'llm_error': llm_error,
+        'text_overflow_strategy': text_overflow_stats,
+        'llm_used': generation_source == 'llm',
+        'fallback_used': generation_source != 'llm',
+        'fallback_reason': llm_error,
     }, False
 
 
@@ -798,6 +1231,9 @@ def _mock_step_output(task: Task, step_code: str) -> dict:
             ],
             'key_facts': ['fact_a', 'fact_b'],
             'evidence_spans': [{'page': 2, 'text': 'sample evidence'}],
+            'images': [],
+            'tables': [],
+            'analysis_source': 'mock_default',
         }
     if step_code == TaskStepCode.RAG_RETRIEVE:
         return {
@@ -1218,15 +1654,446 @@ def _build_assetize_step_output(
     }
 
 
-def _build_slot_fill_value(slide: dict[str, Any], slot: dict[str, Any]) -> Any:
+def _json_safe_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe_payload(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _call_structured_llm_json(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.2,
+    max_tokens: int = 2000,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    result = call_chat_completions(
+        messages=[
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt},
+        ],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    parsed = _extract_json_object(result.content)
+    if not parsed:
+        raise ValueError('llm returned non-json content')
+    return parsed, {'usage': result.usage, 'raw': result.raw}
+
+
+def _call_document_parse_llm(
+    *,
+    task: Task,
+    source_file: File,
+    parsed: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    system_prompt = (
+        'You are a DocumentParseAgent for PDF-to-PPT workflows. '
+        'Return JSON only with keys: sections, key_facts, evidence_spans, doc_summary.'
+    )
+    user_prompt = _json_safe_payload(
+        {
+            'task_no': task.task_no,
+            'detail_level': task.detail_level,
+            'user_prompt': task.user_prompt or '',
+            'source_file': {
+                'filename': source_file.filename,
+                'ext': source_file.ext,
+                'size': source_file.file_size,
+            },
+            'parsed_snapshot': {
+                'sections': (parsed.get('sections') or [])[:20],
+                'key_facts': (parsed.get('key_facts') or [])[:20],
+                'evidence_spans': (parsed.get('evidence_spans') or [])[:20],
+                'images_count': len(parsed.get('images') or []),
+                'tables_count': len(parsed.get('tables') or []),
+            },
+            'instructions': [
+                'Keep sections in reading order.',
+                'Keep key_facts concise and business-oriented.',
+                'Evidence text should be short and attributable with page number.',
+            ],
+        }
+    )
+    return _call_structured_llm_json(
+        system_prompt=system_prompt,
+        user_prompt=json.dumps(user_prompt, ensure_ascii=False),
+        temperature=0.1,
+        max_tokens=1600,
+    )
+
+
+def _call_rag_retrieve_llm(
+    *,
+    task: Task,
+    source_excerpt: str,
+    fallback_keywords: list[str],
+    rule_query: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    system_prompt = (
+        'You are a RagRetrieveAgent. '
+        'Return JSON only with keys: query, topic_weights, reasoning.'
+    )
+    user_prompt = _json_safe_payload(
+        {
+            'task_no': task.task_no,
+            'detail_level': task.detail_level,
+            'rag_enabled': bool(task.rag_enabled),
+            'user_prompt': task.user_prompt or '',
+            'source_excerpt': source_excerpt,
+            'fallback_keywords': fallback_keywords[:12],
+            'rule_query': rule_query,
+            'instructions': [
+                'Rewrite retrieval query for precision and coverage.',
+                'Return 2-8 topic_weights in range [0,1].',
+                'If user_prompt is empty, infer themes from source excerpt and keywords.',
+            ],
+        }
+    )
+    return _call_structured_llm_json(
+        system_prompt=system_prompt,
+        user_prompt=json.dumps(user_prompt, ensure_ascii=False),
+        temperature=0.1,
+        max_tokens=800,
+    )
+
+
+def _normalize_llm_page_suggestions(raw_pages: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_pages, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for raw in raw_pages:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            page_no = int(raw.get('page_no') or raw.get('page') or 0)
+        except Exception:
+            page_no = 0
+        if page_no <= 0:
+            continue
+
+        suggestion: dict[str, Any] = {'page_no': page_no}
+        page_function = _coerce_text(raw.get('page_function') or '').lower()
+        if page_function:
+            suggestion['page_function'] = page_function
+
+        reason = _coerce_text(raw.get('reason') or raw.get('page_function_reason') or raw.get('analysis'))
+        if reason:
+            suggestion['reason'] = reason
+
+        confidence = raw.get('confidence')
+        if isinstance(confidence, (int, float)):
+            suggestion['confidence'] = float(confidence)
+
+        layout_suggestions: dict[str, Any] = {}
+        for candidate in (raw.get('layout_suggestions'), raw.get('layout')):
+            if isinstance(candidate, dict):
+                layout_suggestions.update(candidate)
+        for key in ('density_hint', 'title_style', 'columns', 'text_alignment', 'max_bullets', 'layout_strategy'):
+            if key in raw and raw.get(key) is not None:
+                layout_suggestions[key] = raw.get(key)
+        if layout_suggestions:
+            suggestion['layout_suggestions'] = layout_suggestions
+
+        style_suggestions: dict[str, Any] = {}
+        for candidate in (raw.get('style_suggestions'), raw.get('style')):
+            if isinstance(candidate, dict):
+                style_suggestions.update(candidate)
+        for key in ('accent_strategy', 'primary_color', 'accent_color', 'background_color', 'text_color'):
+            if key in raw and raw.get(key) is not None:
+                style_suggestions[key] = raw.get(key)
+        if style_suggestions:
+            suggestion['style_suggestions'] = style_suggestions
+
+        normalized.append(suggestion)
+
+    return normalized
+
+
+def _normalize_llm_slot_overrides(raw_overrides: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_overrides, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for raw in raw_overrides:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            slide_no = int(raw.get('slide_no') or raw.get('page_no') or raw.get('slide') or 0)
+        except Exception:
+            slide_no = 0
+        if slide_no <= 0:
+            continue
+
+        slot_key = _coerce_text(raw.get('slot_key') or raw.get('slot') or raw.get('name'))
+        slot_type = _coerce_text(raw.get('slot_type') or raw.get('type') or '').lower()
+        if not slot_key:
+            continue
+        if slot_type not in {'text', 'image', 'table'}:
+            slot_type = 'text'
+
+        override: dict[str, Any] = {
+            'slide_no': slide_no,
+            'slot_key': slot_key,
+            'slot_type': slot_type,
+        }
+        content_source = _coerce_text(raw.get('content_source') or raw.get('source'))
+        if content_source:
+            override['content_source'] = content_source
+        fill_status = _coerce_text(raw.get('fill_status'))
+        if fill_status:
+            override['fill_status'] = fill_status
+        quality_score = raw.get('quality_score')
+        if isinstance(quality_score, (int, float)):
+            override['quality_score'] = float(quality_score)
+
+        planned_value = raw.get('planned_value')
+        if planned_value is None:
+            planned_value = raw.get('hint')
+        if planned_value is None:
+            planned_value = raw.get('value')
+        if planned_value is not None:
+            override['planned_value'] = planned_value
+
+        normalized.append(override)
+
+    return normalized
+
+
+def _normalize_llm_fix_ops(raw_fix_ops: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_fix_ops, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for raw in raw_fix_ops:
+        if not isinstance(raw, dict):
+            continue
+        op = _coerce_text(raw.get('op') or raw.get('action') or raw.get('type'))
+        if not op:
+            continue
+        fix_op: dict[str, Any] = {'op': op}
+        for key in ('target', 'reason', 'reason_code', 'scope', 'page_no', 'priority'):
+            value = raw.get(key)
+            if value not in (None, '', []):
+                fix_op[key] = value
+        normalized.append(fix_op)
+    return normalized
+
+
+def _call_map_slots_llm(
+    *,
+    task: Task,
+    slide_plan: list[dict[str, Any]],
+    template_pages: list[dict[str, Any]],
+    parsed_images: list[dict[str, Any]],
+    parsed_tables: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    system_prompt = (
+        'You are a presentation slot-mapping agent. '
+        'Return JSON only with page_suggestions and slot_fill_overrides.'
+    )
+    user_prompt = _json_safe_payload(
+        {
+            'detail_level': task.detail_level,
+            'task_no': task.task_no,
+            'slide_plan': slide_plan,
+            'template_pages': [
+                {
+                    'page_no': page.get('page_no'),
+                    'page_function': page.get('page_function'),
+                    'cluster_label': page.get('cluster_label'),
+                    'layout_schema_json': page.get('layout_schema_json'),
+                    'style_tokens_json': page.get('style_tokens_json'),
+                }
+                for page in template_pages[:24]
+            ],
+            'parsed_image_samples': [
+                {
+                    'page_no': image.get('page_no'),
+                    'image_path': image.get('image_path') or image.get('path'),
+                    'caption': image.get('caption'),
+                    'alt_text': image.get('alt_text'),
+                }
+                for image in parsed_images[:8]
+            ],
+            'parsed_table_samples': [
+                {
+                    'page_no': table.get('page_no'),
+                    'title': table.get('title'),
+                    'headers': table.get('headers'),
+                    'rows': table.get('rows')[:3] if isinstance(table.get('rows'), list) else table.get('rows'),
+                }
+                for table in parsed_tables[:8]
+            ],
+            'instructions': [
+                'Prefer same-type template pages first, then similar pages.',
+                'Return page_suggestions in the shape accepted by template suggestion overlay.',
+                'Return slot_fill_overrides only when you can improve a text/image/table slot with concrete hints.',
+            ],
+        }
+    )
+    payload, meta = _call_structured_llm_json(system_prompt=system_prompt, user_prompt=json.dumps(user_prompt, ensure_ascii=False))
+    return payload, meta
+
+
+def _call_generate_slides_llm(
+    *,
+    task: Task,
+    mapped_slide_plan: list[dict[str, Any]],
+    slot_fill_plan: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    system_prompt = (
+        'You are a slide generation agent. '
+        'Return JSON only with edit_ops and optionally mapped_slide_plan.'
+    )
+    user_prompt = _json_safe_payload(
+        {
+            'detail_level': task.detail_level,
+            'task_no': task.task_no,
+            'mapped_slide_plan': mapped_slide_plan,
+            'slot_fill_plan': slot_fill_plan[:120],
+            'instructions': [
+                'Create concrete edit_ops for title, bullets, tables and images.',
+                'Keep the structure editable and template aligned.',
+                'If you emit mapped_slide_plan, keep it slide-by-slide aligned to the input plan.',
+            ],
+        }
+    )
+    payload, meta = _call_structured_llm_json(system_prompt=system_prompt, user_prompt=json.dumps(user_prompt, ensure_ascii=False), max_tokens=2800)
+    return payload, meta
+
+
+def _call_self_correct_llm(
+    *,
+    task: Task,
+    slide_plan: list[dict[str, Any]],
+    slot_fill_plan: list[dict[str, Any]],
+    edit_ops: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    system_prompt = (
+        'You are a layout self-correction agent. '
+        'Return JSON only with fix_ops, retry_recommended and quality_report.'
+    )
+    user_prompt = _json_safe_payload(
+        {
+            'detail_level': task.detail_level,
+            'task_no': task.task_no,
+            'slide_plan': slide_plan,
+            'slot_fill_plan': slot_fill_plan[:120],
+            'edit_ops': edit_ops[:120],
+            'instructions': [
+                'Detect overflow, collision, alignment, and density problems.',
+                'Prefer conservative fixes that preserve editability.',
+                'Provide a quality_report with overflow, collision and risk_score when possible.',
+            ],
+        }
+    )
+    payload, meta = _call_structured_llm_json(system_prompt=system_prompt, user_prompt=json.dumps(user_prompt, ensure_ascii=False), max_tokens=2200)
+    return payload, meta
+
+
+def _pop_best_asset_for_slide(
+    assets: list[dict[str, Any]],
+    *,
+    slide_no: int,
+    state: dict[str, Any],
+    key: str,
+) -> dict[str, Any] | None:
+    if not assets:
+        return None
+
+    used_key = f'{key}_used'
+    used_indices = state.get(used_key)
+    if not isinstance(used_indices, list):
+        used_indices = []
+        state[used_key] = used_indices
+    consumed = {int(item) for item in used_indices if isinstance(item, int)}
+
+    candidate_indices = [idx for idx in range(len(assets)) if idx not in consumed]
+    if not candidate_indices:
+        return None
+
+    exact_page = [idx for idx in candidate_indices if int(assets[idx].get('page_no') or 0) == slide_no]
+    if exact_page:
+        chosen = exact_page[0]
+        used_indices.append(chosen)
+        state[key] = chosen + 1
+        return assets[chosen]
+
+    chosen = min(
+        candidate_indices,
+        key=lambda idx: (
+            abs(int(assets[idx].get('page_no') or slide_no) - slide_no),
+            idx,
+        ),
+    )
+    used_indices.append(chosen)
+    state[key] = chosen + 1
+    return assets[chosen]
+
+
+def _build_slot_fill_value(
+    slide: dict[str, Any],
+    slot: dict[str, Any],
+    *,
+    parsed_images: list[dict[str, Any]] | None = None,
+    parsed_tables: list[dict[str, Any]] | None = None,
+    asset_cursor_state: dict[str, Any] | None = None,
+) -> Any:
     title = str(slide.get('title') or '').strip()
     bullets = _to_bullet_list(slide.get('bullets'))
     slot_type = str(slot.get('slot_type') or 'text')
     slot_role = str(slot.get('slot_role') or '')
+    slide_no = int(slide.get('page_no') or slide.get('slide_no') or 0)
+    cursor_state = asset_cursor_state if isinstance(asset_cursor_state, dict) else {}
 
     if slot_type == 'image':
+        image_asset = _pop_best_asset_for_slide(
+            parsed_images or [],
+            slide_no=slide_no,
+            state=cursor_state,
+            key='image_index',
+        )
+        if image_asset:
+            image_path = _coerce_text(image_asset.get('image_path') or image_asset.get('path'))
+            caption = _coerce_text(image_asset.get('caption') or image_asset.get('alt_text'), default=title or f'Image S{slide_no}')
+            return {
+                'source': 'doc_image',
+                'hint': {
+                    'image_path': image_path,
+                    'path': image_path,
+                    'caption': caption,
+                    'alt_text': _coerce_text(image_asset.get('alt_text'), default=caption),
+                    'source': 'pdf_native_image',
+                },
+            }
         return {'source': 'doc_image', 'hint': title or f"image_for_slide_{slide.get('page_no')}"}
     if slot_type == 'table':
+        table_asset = _pop_best_asset_for_slide(
+            parsed_tables or [],
+            slide_no=slide_no,
+            state=cursor_state,
+            key='table_index',
+        )
+        if table_asset:
+            return {
+                'source': 'doc_table',
+                'hint': {
+                    'title': _coerce_text(table_asset.get('title'), default=f'Table S{slide_no}'),
+                    'headers': table_asset.get('headers') or ['Item', 'Value'],
+                    'rows': table_asset.get('rows') or [[title or f'Slide {slide_no}', '']],
+                    'source': 'pdf_native_table',
+                },
+            }
         return {'source': 'doc_table', 'hint': bullets[:4] or [title]}
     if slot_role == 'title':
         return title
@@ -1247,6 +2114,54 @@ def _extract_slot_hint(slot_fill_item: dict[str, Any]) -> Any:
                 return value
         return planned_value
     return planned_value
+
+
+def _slot_has_real_image_asset(planned_value: Any) -> bool:
+    if not isinstance(planned_value, dict):
+        return False
+    hint = planned_value.get('hint')
+    if isinstance(hint, dict):
+        image_path = _coerce_text(hint.get('image_path') or hint.get('path'))
+        return bool(image_path)
+    return False
+
+
+def _slot_has_structured_table_asset(planned_value: Any) -> bool:
+    if not isinstance(planned_value, dict):
+        return False
+    hint = planned_value.get('hint')
+    if isinstance(hint, dict):
+        headers = hint.get('headers')
+        rows = hint.get('rows')
+        has_headers = isinstance(headers, list) and len(headers) > 0
+        has_rows = isinstance(rows, list) and len(rows) > 0
+        return has_headers and has_rows
+    return False
+
+
+def _determine_slot_fill_status(
+    *,
+    slot_type: str,
+    planned_value: Any,
+    template_mapping_fallback_level: int,
+) -> tuple[str, float]:
+    slot = (slot_type or 'text').lower()
+    mapping_fallback = int(template_mapping_fallback_level)
+
+    if slot == 'image':
+        if _slot_has_real_image_asset(planned_value):
+            return ('success', 0.95 if mapping_fallback == 0 else 0.86)
+        return ('fallback', 0.74)
+
+    if slot == 'table':
+        if _slot_has_structured_table_asset(planned_value):
+            return ('success', 0.95 if mapping_fallback == 0 else 0.86)
+        return ('fallback', 0.72)
+
+    text_ok = bool(_coerce_text(planned_value))
+    if text_ok:
+        return ('success', 0.95 if mapping_fallback == 0 else 0.84)
+    return ('fallback', 0.7)
 
 
 def _coerce_text(value: Any, default: str = '') -> str:
@@ -1466,6 +2381,7 @@ def _build_map_slots_step_output(
 ) -> dict[str, Any]:
     plan_output = step_outputs.get(TaskStepCode.PLAN_SLIDES) or {}
     asset_output = step_outputs.get(TaskStepCode.ASSETIZE_TEMPLATE) or {}
+    parse_output = step_outputs.get(TaskStepCode.PARSE_PDF) or {}
     slide_plan = plan_output.get('slide_plan') or []
     if not slide_plan:
         slide_plan = (_mock_step_output(task, TaskStepCode.PLAN_SLIDES)).get('slide_plan') or []
@@ -1492,6 +2408,52 @@ def _build_map_slots_step_output(
 
     mapping = map_slide_plan_to_template(slide_plan=slide_plan, template_pages=template_pages)
     mapped_slide_plan = mapping.get('mapped_slide_plan') or slide_plan
+    parsed_images = parse_output.get('images') or []
+    parsed_tables = parse_output.get('tables') or []
+    llm_usage: dict[str, Any] | None = None
+    llm_error: str | None = None
+    llm_suggestions_total = 0
+    llm_suggestions_applied = 0
+    slot_override_index: dict[tuple[int, str, str], dict[str, Any]] = {}
+    try:
+        raw_llm_output, llm_meta = _call_map_slots_llm(
+            task=task,
+            slide_plan=slide_plan,
+            template_pages=template_pages,
+            parsed_images=parsed_images,
+            parsed_tables=parsed_tables,
+        )
+        llm_suggestions = _normalize_llm_page_suggestions(
+            raw_llm_output.get('page_suggestions')
+            or raw_llm_output.get('llm_page_suggestions')
+            or raw_llm_output.get('pages')
+        )
+        llm_overlay = apply_template_llm_suggestions(
+            mapped_slide_plan=mapped_slide_plan,
+            llm_page_suggestions=llm_suggestions,
+        )
+        mapped_slide_plan = llm_overlay.get('mapped_slide_plan') or mapped_slide_plan
+        llm_suggestions_total = int(llm_overlay.get('suggestions_total') or 0)
+        llm_suggestions_applied = int(llm_overlay.get('suggestions_applied') or 0)
+        slot_overrides = _normalize_llm_slot_overrides(
+            raw_llm_output.get('slot_fill_overrides')
+            or raw_llm_output.get('slot_overrides')
+            or raw_llm_output.get('slot_hints')
+        )
+        for override in slot_overrides:
+            slot_override_index[(int(override['slide_no']), str(override['slot_key']), str(override['slot_type']))] = override
+        llm_usage = llm_meta.get('usage') if isinstance(llm_meta, dict) else None
+        map_analysis_source = 'map_slots_llm'
+    except Exception as exc:
+        llm_error = str(exc)
+        logger.warning('map slots llm failed, fallback rule-based mapping used: %s', exc)
+        map_analysis_source = 'slot_mapping_service'
+    asset_cursor_state: dict[str, Any] = {
+        'image_index': 0,
+        'table_index': 0,
+        'image_index_used': [],
+        'table_index_used': [],
+    }
     page_mappings: list[dict[str, Any]] = []
     slot_fill_plan: list[dict[str, Any]] = []
 
@@ -1521,21 +2483,56 @@ def _build_map_slots_step_output(
         )
 
         for slot in slot_specs:
+            slot_type = str(slot['slot_type'])
+            override = slot_override_index.get((slide_no, str(slot['slot_key']), slot_type))
+            if override is not None:
+                planned_value = override.get('planned_value')
+                if planned_value is None:
+                    planned_value = _build_slot_fill_value(
+                        slide,
+                        slot,
+                        parsed_images=parsed_images,
+                        parsed_tables=parsed_tables,
+                        asset_cursor_state=asset_cursor_state,
+                    )
+                content_source = str(override.get('content_source') or ('llm_text' if slot_type == 'text' else ('doc_table' if slot_type == 'table' else 'doc_image')))
+                fill_status = str(override.get('fill_status') or '')
+                quality_score = override.get('quality_score')
+            else:
+                planned_value = _build_slot_fill_value(
+                    slide,
+                    slot,
+                    parsed_images=parsed_images,
+                    parsed_tables=parsed_tables,
+                    asset_cursor_state=asset_cursor_state,
+                )
+                content_source = 'llm_text' if slot_type == 'text' else ('doc_table' if slot_type == 'table' else 'doc_image')
+                fill_status = ''
+                quality_score = None
+            computed_fill_status, computed_quality_score = _determine_slot_fill_status(
+                slot_type=slot_type,
+                planned_value=planned_value,
+                template_mapping_fallback_level=fallback_level,
+            )
+            if fill_status not in {'success', 'adjusted', 'fallback', 'failed'}:
+                fill_status = computed_fill_status
+            if quality_score is None:
+                quality_score = computed_quality_score
+            if fill_status == 'fallback':
+                task.fallback_used = 1
             slot_fill_plan.append(
                 {
                     'slide_no': slide_no,
                     'slot_key': str(slot['slot_key']),
-                    'slot_type': str(slot['slot_type']),
-                    'content_source': 'llm_text'
-                    if str(slot['slot_type']) == 'text'
-                    else ('doc_table' if str(slot['slot_type']) == 'table' else 'doc_image'),
-                    'fill_status': 'success' if fallback_level == 0 else 'fallback',
-                    'quality_score': 0.95 if fallback_level == 0 else 0.80,
+                    'slot_type': slot_type,
+                    'content_source': content_source,
+                    'fill_status': fill_status,
+                    'quality_score': quality_score,
                     'overflow_flag': False,
                     'overlap_flag': False,
                     'fill_json': {
                         'slot_role': slot['slot_role'],
-                        'planned_value': _build_slot_fill_value(slide, slot),
+                        'planned_value': planned_value,
                     },
                 }
             )
@@ -1550,7 +2547,20 @@ def _build_map_slots_step_output(
         'mapped_slide_plan': mapped_slide_plan,
         'page_mappings': page_mappings,
         'slot_fill_plan': slot_fill_plan,
-        'analysis_source': 'slot_mapping_service',
+        'parsed_asset_usage': {
+            'images_total': len(parsed_images),
+            'tables_total': len(parsed_tables),
+            'images_used': len(asset_cursor_state.get('image_index_used') or []),
+            'tables_used': len(asset_cursor_state.get('table_index_used') or []),
+        },
+        'analysis_source': map_analysis_source,
+        'llm_usage': llm_usage,
+        'llm_error': llm_error,
+        'llm_used': map_analysis_source == 'map_slots_llm',
+        'fallback_used': map_analysis_source != 'map_slots_llm',
+        'fallback_reason': llm_error,
+        'llm_suggestions_total': llm_suggestions_total,
+        'llm_suggestions_applied': llm_suggestions_applied,
     }
 
 
@@ -1597,7 +2607,7 @@ def _normalize_quality_payload(
 
     return {
         'attempt_no': attempt_no,
-        'metric_version': 'v1.1',
+        'metric_version': 'v1.0',
         'evaluated_pages': evaluated_pages,
         'pass_flag': pass_flag,
         'layout_offset_ratio': 1.0 if overflow else 0.0,
@@ -1612,7 +2622,7 @@ def _normalize_quality_payload(
         'locked_page_ratio': page_metrics['locked_page_ratio'],
         'evaluated_scope_json': {
             'excluded_page_types': page_metrics['excluded_page_types'],
-            'metric_version': 'v1.1',
+            'metric_version': 'v1.0',
             'calculation': 'editable_text_ratio=editable_pages/evaluated_pages; locked_page_ratio=locked_pages/evaluated_pages',
             'page_diagnostics': page_metrics['page_diagnostics'],
         },
@@ -1786,14 +2796,24 @@ def _write_result_file(
     task: Task,
     filename: str,
     slide_plan: list[dict[str, Any]],
+    reference_file: File | None = None,
 ) -> tuple[File, dict[str, Any]]:
     settings = get_settings()
     rel_path = f'{settings.result_subdir}/{task.user_id}/{task.task_no}/{filename}'
     full_path = settings.storage_root_path / rel_path
     full_path.parent.mkdir(parents=True, exist_ok=True)
+    template_path: Path | None = None
+    if reference_file and reference_file.storage_path:
+        candidate = settings.storage_root_path / reference_file.storage_path
+        if candidate.is_file() and candidate.suffix.lower() == '.pptx':
+            template_path = candidate
 
     try:
-        render_summary = generate_pptx_from_plan(slide_plan=slide_plan, output_path=full_path)
+        render_summary = generate_pptx_from_plan(
+            slide_plan=slide_plan,
+            output_path=full_path,
+            template_path=template_path,
+        )
     except PPTXGenerationError as exc:
         raise RuntimeError(f'failed to render pptx: {exc}') from exc
 
@@ -2026,7 +3046,17 @@ def process_single_task(db: Session, task: Task) -> None:
 
                 try:
                     output_json = _mock_step_output(task, step_code)
-                    if step_code == TaskStepCode.ANALYZE_TEMPLATE:
+                    if step_code == TaskStepCode.PARSE_PDF:
+                        output_json, parse_fallback_used = _build_parse_pdf_step_output(task, source_file)
+                        if parse_fallback_used:
+                            add_task_event(
+                                db,
+                                task_id=task.id,
+                                event_type=TaskEventType.WARNING,
+                                message='parse pdf failed, fallback mock applied',
+                                payload_json={'step_code': step_code, 'reason': output_json.get('fallback_reason')},
+                            )
+                    elif step_code == TaskStepCode.ANALYZE_TEMPLATE:
                         raw_analysis, is_fallback = _analyze_template(db, task, reference_file)
                         if raw_analysis.get('__persisted__'):
                             output_json = {k: v for k, v in raw_analysis.items() if k != '__persisted__'}
@@ -2075,7 +3105,6 @@ def process_single_task(db: Session, task: Task) -> None:
                                 message='rag retrieve failed, fallback mock applied',
                                 payload_json={'step_code': step_code, 'error': str(exc)},
                             )
-                        output_json['analysis_source'] = 'rag_service' if not rag_fallback_used else 'rag_fallback'
                     elif step_code == TaskStepCode.PLAN_SLIDES:
                         output_json, plan_fallback_used = _build_plan_slides_step_output(task, source_file, step_outputs)
                         task.page_count_estimated = output_json.get('page_count_estimated', task.page_count_estimated)
@@ -2129,7 +3158,6 @@ def process_single_task(db: Session, task: Task) -> None:
                             )
                     elif step_code == TaskStepCode.SELF_CORRECT:
                         output_json = _build_self_correct_step_output(task, step_outputs)
-                        output_json['analysis_source'] = 'self_correct_service'
                         quality_payload = _normalize_quality_payload(
                             task,
                             step_outputs=step_outputs,
@@ -2171,7 +3199,13 @@ def process_single_task(db: Session, task: Task) -> None:
                         if not slide_plan:
                             slide_plan = (_mock_step_output(task, TaskStepCode.PLAN_SLIDES)).get('slide_plan') or []
 
-                        result_file, render_summary = _write_result_file(db, task, filename, slide_plan=slide_plan)
+                        result_file, render_summary = _write_result_file(
+                            db,
+                            task,
+                            filename,
+                            slide_plan=slide_plan,
+                            reference_file=reference_file,
+                        )
                         task.result_file_id = result_file.id
                         task.page_count_final = len(slide_plan) or task.page_count_estimated or 12
                         preview_files = _write_preview_files(
@@ -2187,6 +3221,8 @@ def process_single_task(db: Session, task: Task) -> None:
                             'preview_count': len(preview_files),
                             'render_summary': render_summary,
                         }
+
+                    output_json = _attach_step_audit_fields(step_code, output_json)
 
                     finished_at = datetime.utcnow()
                     _upsert_step(

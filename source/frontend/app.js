@@ -1,5 +1,6 @@
 ﻿import { initMetricsView } from './metrics_view.js';
 import { initReplayView } from './replay_view.js';
+import { initObservabilityView } from './observability_view.js';
 
 const API_BASE = 'http://127.0.0.1:8000/api/v1';
 
@@ -26,6 +27,9 @@ const metricsPanel = document.getElementById('metricsPanel');
 const metricsStatus = document.getElementById('metricsStatus');
 const metricsRefreshBtn = document.getElementById('metricsRefreshBtn');
 const metricsDaysInput = document.getElementById('metricsDaysInput');
+const observabilityPanel = document.getElementById('observabilityPanel');
+const observabilityStatus = document.getElementById('observabilityStatus');
+const observabilityRefreshBtn = document.getElementById('observabilityRefreshBtn');
 
 function pretty(json) {
   return JSON.stringify(json, null, 2);
@@ -226,6 +230,7 @@ function renderTaskDetail(task, events) {
 
 let replayView;
 let metricsView;
+let observabilityView;
 
 async function refreshTask() {
   const taskNo = taskNoInput.value.trim();
@@ -241,6 +246,9 @@ async function refreshTask() {
 
     if (replayView) {
       replayView.refresh();
+    }
+    if (observabilityView) {
+      observabilityView.refresh();
     }
 
     if (['succeeded', 'failed', 'canceled'].includes(detail.data.status) && pollTimer) {
@@ -406,5 +414,15 @@ metricsView = initMetricsView({
   metricsDaysInput,
 });
 
+observabilityView = initObservabilityView({
+  api,
+  escapeHtml,
+  taskNoInput,
+  panel: observabilityPanel,
+  statusNode: observabilityStatus,
+  refreshBtn: observabilityRefreshBtn,
+});
+
 loadTaskList();
 metricsView.loadMetrics();
+

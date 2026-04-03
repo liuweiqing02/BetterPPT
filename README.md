@@ -51,6 +51,15 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+可选：启用本地真实 Vision embedding（模板多模态分析）：
+
+```powershell
+cd <repo-root>
+source\backend\.venv\Scripts\python.exe bin\setup_local_vision_model.py
+```
+
+说明：该脚本会安装 CPU 版 `torch` 并将 ViT 模型下载到 `source/backend/models/vision/`，运行时按离线模式加载。
+
 ### 3) 准备环境变量
 
 ```powershell
@@ -96,6 +105,10 @@ python -m http.server 5173
 | `LLM_API_BASE` | 模型服务地址 | 是 |
 | `LLM_API_KEY` | 模型服务密钥 | 是 |
 | `LLM_MODEL` | 模型名 | 是 |
+| `LLM_REQUEST_TIMEOUT_SECONDS` | 单次 LLM 请求超时（秒） | 否 |
+| `LLM_REQUEST_MAX_RETRIES` | LLM 请求最大重试次数 | 否 |
+| `BETTERPPT_TEMPLATE_VISION_MODEL_PATH` | 本地 Vision 模型目录（离线优先） | 否 |
+| `BETTERPPT_TEMPLATE_VISION_CACHE_DIR` | 本地 HF 缓存目录 | 否 |
 | `LOCAL_STORAGE_ROOT` | 本地存储根目录 | 否 |
 
 ## 测试说明

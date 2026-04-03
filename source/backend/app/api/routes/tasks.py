@@ -10,6 +10,7 @@ from app.core.security import CurrentUser
 from app.db.session import get_db
 from app.models.file import File
 from app.models.task import Task
+from app.models.task_step import TaskStep
 from app.schemas.common import APIResponse
 from app.schemas.task import (
     PreviewSlide,
@@ -22,6 +23,7 @@ from app.schemas.task import (
     TaskMappingItemData,
     TaskMappingsData,
     TaskListData,
+    TaskObservabilityData,
     TaskPreviewData,
     TaskQualityReportData,
     TaskReplayData,
@@ -29,7 +31,7 @@ from app.schemas.task import (
     TaskResultData,
     TaskSummary,
 )
-from app.services.file_service import get_file_by_id
+from app.services.file_service import build_signed_download_url, get_file_by_id
 from app.services.task_service import (
     cancel_task,
     create_task,
@@ -53,6 +55,8 @@ def _task_summary(task) -> TaskSummary:
         current_step=task.current_step,
         progress=task.progress,
         detail_level=task.detail_level,
+        rag_enabled=bool(task.rag_enabled),
+        user_prompt=task.user_prompt,
         page_count_estimated=task.page_count_estimated,
         page_count_final=task.page_count_final,
         error_code=task.error_code,
@@ -60,6 +64,62 @@ def _task_summary(task) -> TaskSummary:
         created_at=task.created_at,
         updated_at=task.updated_at,
     )
+
+
+def _latest_step_outputs(db: Session, task_id: int) -> tuple[dict[str, dict], int | None]:
+    rows = list(
+        db.scalars(
+            select(TaskStep)
+            .where(TaskStep.task_id == task_id, TaskStep.step_status == 'succeeded')
+            .order_by(TaskStep.step_order.asc(), TaskStep.attempt_no.desc(), TaskStep.id.desc())
+        ).all()
+    )
+    latest: dict[str, dict] = {}
+    max_attempt: int | None = None
+    for row in rows:
+        try:
+            attempt_no = int(row.attempt_no or 1)
+            max_attempt = attempt_no if max_attempt is None else max(max_attempt, attempt_no)
+        except Exception:
+            pass
+        if row.step_code in latest:
+            continue
+        latest[row.step_code] = row.output_json if isinstance(row.output_json, dict) else {}
+    return latest, max_attempt
+
+
+def _normalize_top_chunks(raw_chunks: list[dict] | None, limit: int = 5) -> list[dict]:
+    items = raw_chunks if isinstance(raw_chunks, list) else []
+    top: list[dict] = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        excerpt = str(item.get('excerpt') or item.get('text') or '').strip()
+        top.append(
+            {
+                'chunk_id': item.get('chunk_id'),
+                'score': item.get('score'),
+                'excerpt': excerpt[:220],
+            }
+        )
+    return top
+
+
+def _normalize_topic_weights(raw_weights: dict | None) -> dict[str, float]:
+    if not isinstance(raw_weights, dict):
+        return {}
+    pairs: list[tuple[str, float]] = []
+    for key, value in raw_weights.items():
+        topic = str(key or '').strip()
+        if not topic:
+            continue
+        try:
+            score = float(value)
+        except Exception:
+            continue
+        pairs.append((topic, score))
+    pairs.sort(key=lambda item: item[1], reverse=True)
+    return {key: round(value, 4) for key, value in pairs[:10]}
 
 
 def _build_data_url_preview(task_no: str, page_count: int) -> list[PreviewSlide]:
@@ -97,7 +157,12 @@ def _build_file_url_preview(task: Task, db: Session, request: Request) -> list[P
             PreviewSlide(
                 slide_no=_extract_page_no(file.filename),
                 page_no=_extract_page_no(file.filename),
-                image_url=f'{base_url}/api/v1/files/download/{file.id}',
+                image_url=build_signed_download_url(
+                    base_url=base_url,
+                    file_id=file.id,
+                    user_id=task.user_id,
+                    expires_in=3600,
+                ),
                 file_id=file.id,
                 storage_path=file.storage_path,
                 mime_type=file.mime_type,
@@ -220,6 +285,102 @@ def get_task_quality_report_view(
     return APIResponse(data=data)
 
 
+@router.get('/{task_no}/observability', response_model=APIResponse)
+def get_task_observability_view(
+    task_no: str,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> APIResponse:
+    task = get_task_by_no(db, user_id=current_user.id, task_no=task_no)
+    step_outputs, latest_attempt_no = _latest_step_outputs(db, task.id)
+
+    rag_output = step_outputs.get('rag_retrieve') or {}
+    plan_output = step_outputs.get('plan_slides') or {}
+    map_output = step_outputs.get('map_slots') or {}
+    generate_output = step_outputs.get('generate_slides') or {}
+    self_correct_output = step_outputs.get('self_correct') or {}
+    export_output = step_outputs.get('export_ppt') or {}
+
+    report = get_task_quality_report(db, task_id=task.id)
+
+    prompt_observability = {
+        'user_prompt_present': bool((task.user_prompt or '').strip()),
+        'query_source': rag_output.get('query_source'),
+        'retrieval_query': rag_output.get('query'),
+        'rule_query': rag_output.get('rule_query'),
+        'fallback_text_used': bool(rag_output.get('fallback_text_used')),
+        'source_text_chars': rag_output.get('source_text_chars') or plan_output.get('source_text_chars'),
+        'rag_context_count': plan_output.get('rag_context_count'),
+    }
+
+    rag_observability = {
+        'retrieved_chunks_count': len(rag_output.get('retrieved_chunks') or []),
+        'citations_count': len(rag_output.get('citations') or []),
+        'top_chunks': _normalize_top_chunks(rag_output.get('retrieved_chunks')),
+        'topic_weights': _normalize_topic_weights(rag_output.get('topic_weights')),
+        'llm_usage': rag_output.get('llm_usage'),
+    }
+
+    generation_observability = {
+        'map_llm_suggestions_total': map_output.get('llm_suggestions_total'),
+        'map_llm_suggestions_applied': map_output.get('llm_suggestions_applied'),
+        'mapped_slide_count': len(map_output.get('mapped_slide_plan') or []),
+        'slot_fill_count': len(map_output.get('slot_fill_plan') or []),
+        'text_overflow_strategy': generate_output.get('text_overflow_strategy') or {},
+        'template_edit_stats': ((export_output.get('render_summary') or {}).get('template_edit_stats') or {}),
+    }
+
+    quality_observability = {
+        'metric_version': report.metric_version if report else None,
+        'pass_flag': report.pass_flag if report else None,
+        'style_fidelity_score': float(report.style_fidelity_score) if report and report.style_fidelity_score is not None else None,
+        'text_slot_match_rate': float(report.text_slot_match_rate) if report and report.text_slot_match_rate is not None else None,
+        'image_slot_match_rate': float(report.image_slot_match_rate) if report and report.image_slot_match_rate is not None else None,
+        'table_slot_match_rate': float(report.table_slot_match_rate) if report and report.table_slot_match_rate is not None else None,
+        'auto_fix_success_rate': float(report.auto_fix_success_rate) if report and report.auto_fix_success_rate is not None else None,
+        'fallback_success_rate': float(report.fallback_success_rate) if report and report.fallback_success_rate is not None else None,
+        'risk_score': (self_correct_output.get('quality_report') or {}).get('risk_score'),
+        'quality_flags': {
+            key: bool((self_correct_output.get('quality_report') or {}).get(key))
+            for key in ('overflow', 'collision', 'empty_space', 'alignment_risk', 'density_imbalance', 'title_consistency')
+        },
+    }
+
+    step_sources = {
+        'parse_pdf': str((step_outputs.get('parse_pdf') or {}).get('analysis_source') or ''),
+        'analyze_template': str((step_outputs.get('analyze_template') or {}).get('analysis_source') or ''),
+        'assetize_template': str((step_outputs.get('assetize_template') or {}).get('analysis_source') or ''),
+        'rag_retrieve': str((step_outputs.get('rag_retrieve') or {}).get('analysis_source') or ''),
+        'plan_slides': str((step_outputs.get('plan_slides') or {}).get('plan_source') or ''),
+        'map_slots': str((step_outputs.get('map_slots') or {}).get('analysis_source') or ''),
+        'generate_slides': str((step_outputs.get('generate_slides') or {}).get('generation_source') or ''),
+        'self_correct': str((step_outputs.get('self_correct') or {}).get('analysis_source') or ''),
+    }
+
+    step_audits = {}
+    for step_code, output in step_outputs.items():
+        step_audits[step_code] = {
+            'llm_used': bool(output.get('llm_used')),
+            'fallback_used': bool(output.get('fallback_used')),
+            'fallback_reason': output.get('fallback_reason'),
+        }
+
+    data = TaskObservabilityData(
+        task_no=task.task_no,
+        detail_level=task.detail_level,
+        rag_enabled=bool(task.rag_enabled),
+        user_prompt=task.user_prompt,
+        latest_attempt_no=latest_attempt_no,
+        prompt_observability=prompt_observability,
+        rag_observability=rag_observability,
+        generation_observability=generation_observability,
+        quality_observability=quality_observability,
+        step_sources=step_sources,
+        step_audits=step_audits,
+    )
+    return APIResponse(data=data)
+
+
 @router.get('/{task_no}/mappings', response_model=APIResponse)
 def get_task_mappings_view(
     task_no: str,
@@ -330,7 +491,12 @@ def get_task_result(
         raise AppException(status_code=404, code=1002, message='result file missing')
 
     base_url = str(request.base_url).rstrip('/')
-    download_url = f'{base_url}/api/v1/files/download/{result_file.id}'
+    download_url = build_signed_download_url(
+        base_url=base_url,
+        file_id=result_file.id,
+        user_id=task.user_id,
+        expires_in=3600,
+    )
     data = TaskResultData(
         file_id=result_file.id,
         filename=result_file.filename,

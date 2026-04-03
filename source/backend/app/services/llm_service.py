@@ -14,7 +14,7 @@ from app.core.errors import AppException
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 45
-_MAX_RETRIES = 2
+_DEFAULT_MAX_RETRIES = 2
 _BACKOFF_SECONDS = (1.0, 2.0)
 
 
@@ -116,12 +116,17 @@ def call_chat_completions(
     messages: list[dict[str, Any]],
     temperature: float | None = None,
     max_tokens: int | None = None,
-    timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+    timeout_seconds: int | None = None,
+    max_retries: int | None = None,
 ) -> LLMChatCompletionResult:
     settings = get_settings()
     api_key = (settings.llm_api_key or '').strip()
     if not api_key:
         raise AppException(status_code=500, code=9001, message='LLM API key is not configured')
+    effective_timeout = timeout_seconds if timeout_seconds is not None else int(settings.llm_request_timeout_seconds or _DEFAULT_TIMEOUT_SECONDS)
+    effective_timeout = max(3, effective_timeout)
+    effective_retries = max_retries if max_retries is not None else int(settings.llm_request_max_retries or _DEFAULT_MAX_RETRIES)
+    effective_retries = max(0, effective_retries)
 
     request_payload: dict[str, Any] = {
         'model': model or settings.llm_model,
@@ -137,17 +142,17 @@ def call_chat_completions(
     body = json.dumps(request_payload, ensure_ascii=False).encode('utf-8')
 
     last_error: Exception | None = None
-    for attempt in range(_MAX_RETRIES + 1):
+    for attempt in range(effective_retries + 1):
         try:
             request = urllib.request.Request(url=url, data=body, headers=headers, method='POST')
-            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            with urllib.request.urlopen(request, timeout=effective_timeout) as response:
                 raw_bytes = response.read()
                 payload = _parse_json_body(raw_bytes)
                 content = _extract_content(payload)
                 usage = _extract_usage(payload)
                 return LLMChatCompletionResult(content=content, usage=usage, raw=payload)
         except urllib.error.HTTPError as exc:
-            if _should_retry_http_error(exc) and attempt < _MAX_RETRIES:
+            if _should_retry_http_error(exc) and attempt < effective_retries:
                 delay = _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
                 logger.warning('LLM request retryable HTTP error %s on attempt %s, sleeping %.1fs', exc.code, attempt + 1, delay)
                 time.sleep(delay)
@@ -155,7 +160,7 @@ def call_chat_completions(
                 continue
             _raise_http_error(exc)
         except urllib.error.URLError as exc:
-            if attempt < _MAX_RETRIES:
+            if attempt < effective_retries:
                 delay = _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
                 logger.warning('LLM request network error on attempt %s, sleeping %.1fs: %s', attempt + 1, delay, exc)
                 time.sleep(delay)
@@ -164,7 +169,7 @@ def call_chat_completions(
             last_error = exc
             break
         except TimeoutError as exc:
-            if attempt < _MAX_RETRIES:
+            if attempt < effective_retries:
                 delay = _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
                 logger.warning('LLM request timeout on attempt %s, sleeping %.1fs: %s', attempt + 1, delay, exc)
                 time.sleep(delay)

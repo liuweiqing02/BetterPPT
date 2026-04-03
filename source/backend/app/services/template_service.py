@@ -1,11 +1,15 @@
 ﻿from __future__ import annotations
 
+import importlib
 import hashlib
 import json
 import logging
+import math
+import os
 import re
 import zipfile
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 import xml.etree.ElementTree as ET
@@ -74,6 +78,11 @@ _BASE_LAYOUT_PRESETS: dict[str, list[dict[str, Any]]] = {
 
 _PAGE_FUNCTION_PRIORITY = ['cover', 'toc', 'section', 'comparison', 'ending', 'summary', 'content']
 _LLM_PAGE_BATCH_SIZE = 12
+_DEFAULT_VISION_MODEL_NAME = 'google/vit-base-patch16-224-in21k'
+_DEFAULT_VISION_LOCAL_DIR = (
+    Path(__file__).resolve().parents[2] / 'models' / 'vision' / 'vit-base-patch16-224-in21k'
+).resolve()
+_EMBEDDING_MODEL_DB_MAX_LEN = 64
 
 _COVER_KEYWORDS = {'cover', 'title', 'intro', 'welcome', '封面', '首页', '论文答辩', '模板', 'thesis', 'defense'}
 _TOC_KEYWORDS = {'agenda', 'outline', 'contents', '目录', '议程', '结构', 'overview', 'chapter'}
@@ -94,6 +103,53 @@ _NS = {
 def _normalize_detail_level(detail_level: str | None) -> str:
     normalized = (detail_level or 'balanced').strip().lower()
     return normalized if normalized in DETAIL_LEVEL_PAGE_RANGE else 'balanced'
+
+
+def _resolve_vision_model_ref() -> str:
+    settings = get_settings()
+    local_model_env = _coerce_text(os.getenv('BETTERPPT_TEMPLATE_VISION_MODEL_PATH') or settings.template_vision_model_path)
+    if local_model_env:
+        local_path = Path(local_model_env).expanduser()
+        if local_path.exists():
+            return str(local_path.resolve())
+
+    model_env = _coerce_text(os.getenv('BETTERPPT_TEMPLATE_VISION_MODEL') or settings.template_vision_model or _DEFAULT_VISION_MODEL_NAME)
+    if model_env:
+        candidate = Path(model_env).expanduser()
+        if candidate.exists():
+            return str(candidate.resolve())
+        return model_env
+
+    if _DEFAULT_VISION_LOCAL_DIR.exists():
+        return str(_DEFAULT_VISION_LOCAL_DIR)
+    return _DEFAULT_VISION_MODEL_NAME
+
+
+def _resolve_vision_cache_dir() -> str | None:
+    settings = get_settings()
+    cache_env = _coerce_text(os.getenv('BETTERPPT_TEMPLATE_VISION_CACHE_DIR') or settings.template_vision_cache_dir)
+    if not cache_env:
+        return None
+    return str(Path(cache_env).expanduser().resolve())
+
+
+def _embedding_model_db_value(model_ref: str, embedding_mode: str) -> str:
+    ref = _coerce_text(model_ref)
+    if not ref:
+        return _DEFAULT_EMBEDDING_MODEL
+    if embedding_mode != 'vision_model':
+        return _DEFAULT_EMBEDDING_MODEL
+
+    if ('\\' in ref or '/' in ref) and Path(ref).exists():
+        token = Path(ref).name
+        token = _coerce_text(token) or 'vision-local'
+        value = f'local:{token}'
+    else:
+        value = ref
+
+    if len(value) <= _EMBEDDING_MODEL_DB_MAX_LEN:
+        return value
+    return value[: _EMBEDDING_MODEL_DB_MAX_LEN]
 
 
 def _stable_hash(*parts: object) -> int:
@@ -1045,6 +1101,273 @@ def _assign_cluster_labels(pages: list[dict[str, Any]]) -> int:
     return len(signature_to_label)
 
 
+def _normalize_feature_vector(values: list[float]) -> list[float]:
+    cleaned = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+    if not cleaned:
+        return [0.0]
+    norm = math.sqrt(sum(value * value for value in cleaned))
+    if norm <= 0:
+        return cleaned
+    return [round(value / norm, 8) for value in cleaned]
+
+
+def _page_rule_feature_vector(page: dict[str, Any], total_pages: int, detail_level: str) -> list[float]:
+    metrics = page.get('metrics') or {}
+    page_no = float(page.get('page_no') or 0)
+    page_function = str(page.get('page_function') or 'content')
+    detail_scale = {'concise': 0.82, 'balanced': 1.0, 'detailed': 1.18}.get(detail_level, 1.0)
+    total_pages_safe = float(max(total_pages, 1))
+    function_flags = [
+        1.0 if page_function == 'cover' else 0.0,
+        1.0 if page_function == 'toc' else 0.0,
+        1.0 if page_function == 'section' else 0.0,
+        1.0 if page_function == 'comparison' else 0.0,
+        1.0 if page_function == 'ending' else 0.0,
+        1.0 if page_function == 'summary' else 0.0,
+    ]
+    text_chars = float(metrics.get('text_char_count') or 0)
+    text_boxes = float(metrics.get('text_box_count') or 0)
+    image_count = float(metrics.get('image_count') or 0)
+    shape_count = float(metrics.get('shape_count') or 0)
+    title_boxes = float(metrics.get('title_box_count') or 0)
+    subtitle_boxes = float(metrics.get('subtitle_box_count') or 0)
+    body_boxes = float(metrics.get('body_box_count') or 0)
+    footer_boxes = float(metrics.get('footer_box_count') or 0)
+    placeholder_count = float(sum((metrics.get('placeholder_type_counts') or {}).values()))
+    region_count = float(sum((metrics.get('region_counts') or {}).values()))
+    title_len = float(len(_coerce_text(metrics.get('title_text') or '')))
+    dominant_font_size = float(metrics.get('dominant_font_size') or 0)
+    return _normalize_feature_vector(
+        [
+            page_no / total_pages_safe,
+            (text_chars / 600.0) * detail_scale,
+            text_boxes / 12.0,
+            image_count / 8.0,
+            shape_count / 18.0,
+            title_boxes / 4.0,
+            subtitle_boxes / 4.0,
+            body_boxes / 6.0,
+            footer_boxes / 3.0,
+            placeholder_count / 8.0,
+            region_count / 8.0,
+            title_len / 80.0,
+            dominant_font_size / 40.0,
+            *function_flags,
+        ]
+    )
+
+
+def _build_slide_snapshot_image(page: dict[str, Any], detail_level: str, reference_file: File):
+    try:
+        pil_image = importlib.import_module('PIL.Image')
+        pil_draw = importlib.import_module('PIL.ImageDraw')
+    except Exception:
+        return None
+
+    metrics = page.get('metrics') or {}
+    width = 256
+    height = 256
+    background = _coerce_text((page.get('style_tokens_json') or {}).get('background_color') or '#F7FAFF')
+    text_color = _coerce_text((page.get('style_tokens_json') or {}).get('text_color') or '#1E2B39')
+    accent_color = _coerce_text((page.get('style_tokens_json') or {}).get('primary_color') or '#1B6EF3')
+    image = pil_image.new('RGB', (width, height), background)
+    draw = pil_draw.Draw(image)
+
+    title_bar_h = 28 if page.get('page_function') in {'cover', 'section'} else 20
+    draw.rectangle([14, 16, width - 14, 16 + title_bar_h], fill=accent_color)
+    body_top = 16 + title_bar_h + 12
+
+    text_boxes = max(1, int(metrics.get('text_box_count') or 0))
+    image_boxes = max(0, int(metrics.get('image_count') or 0))
+    shape_boxes = max(0, int(metrics.get('shape_count') or 0))
+    rows = max(2, min(6, text_boxes + 1))
+    col_split = 144 if image_boxes or page.get('page_function') in {'comparison', 'content'} else 212
+    row_height = max(12, (height - body_top - 22) // rows)
+
+    for idx in range(rows):
+        top = body_top + idx * row_height
+        left = 18
+        right = col_split if idx % 2 == 0 else width - 18
+        outline = accent_color if idx % 2 == 0 else text_color
+        draw.rectangle([left, top, right, min(height - 18, top + row_height - 4)], outline=outline, width=2)
+
+    if image_boxes:
+        draw.rectangle([col_split + 10, body_top, width - 18, height - 56], outline=accent_color, width=2)
+        draw.rectangle([col_split + 20, body_top + 10, width - 28, body_top + 54], fill=accent_color)
+    else:
+        draw.line([col_split, body_top, col_split, height - 40], fill=accent_color, width=2)
+
+    footer_y = height - 34
+    draw.rectangle([18, footer_y, width - 18, height - 18], fill=text_color)
+    if shape_boxes > 2:
+        draw.ellipse([width - 52, 22, width - 24, 50], outline=accent_color, width=2)
+
+    return image
+
+
+@lru_cache(maxsize=1)
+def _load_vision_modules() -> tuple[Any | None, Any | None, str | None]:
+    try:
+        torch = importlib.import_module('torch')
+        transformers = importlib.import_module('transformers')
+    except Exception as exc:
+        return None, None, f'vision deps unavailable: {exc}'
+    return torch, transformers, None
+
+
+@lru_cache(maxsize=4)
+def _load_vision_processor_and_model(model_ref: str, cache_dir: str | None) -> tuple[Any | None, Any | None, str | None]:
+    torch, transformers, load_error = _load_vision_modules()
+    if load_error:
+        return None, None, load_error
+
+    try:
+        processor_cls = getattr(transformers, 'AutoImageProcessor', None) or getattr(transformers, 'AutoProcessor', None)
+        model_cls = getattr(transformers, 'AutoModel', None)
+        if processor_cls is None or model_cls is None:
+            raise RuntimeError('transformers vision classes unavailable')
+        kwargs: dict[str, Any] = {'local_files_only': True}
+        if cache_dir:
+            kwargs['cache_dir'] = cache_dir
+        processor = processor_cls.from_pretrained(model_ref, **kwargs)
+        model = model_cls.from_pretrained(model_ref, **kwargs)
+        model.eval()
+        return torch, (processor, model), None
+    except Exception as exc:
+        return None, None, f'vision model unavailable: {exc}'
+
+
+def _build_vision_embedding_vector(
+    page: dict[str, Any],
+    detail_level: str,
+    reference_file: File,
+    *,
+    model_ref: str,
+    cache_dir: str | None,
+) -> tuple[list[float] | None, str | None, str | None]:
+    image = _build_slide_snapshot_image(page, detail_level, reference_file)
+    if image is None:
+        return None, None, 'PIL image snapshot unavailable'
+
+    try:
+        torch, model_bundle, load_error = _load_vision_processor_and_model(model_ref, cache_dir)
+        if load_error:
+            raise RuntimeError(load_error)
+        assert model_bundle is not None
+        processor, model = model_bundle
+        with torch.no_grad():
+            inputs = processor(images=image, return_tensors='pt')
+            outputs = model(**inputs)
+            tensor = getattr(outputs, 'last_hidden_state', None)
+            if tensor is None:
+                tensor = getattr(outputs, 'pooler_output', None)
+            if tensor is None:
+                raise RuntimeError('vision model returned no tensor output')
+            if hasattr(tensor, 'mean') and len(getattr(tensor, 'shape', [])) >= 2:
+                tensor = tensor.mean(dim=1)
+            if hasattr(tensor, 'detach'):
+                tensor = tensor.detach().cpu()
+            flattened = tensor.flatten().tolist()
+        if not flattened:
+            raise RuntimeError('vision embedding empty')
+        return _normalize_feature_vector([float(value) for value in flattened[:384]]), 'vision_model', None
+    except Exception as exc:
+        return None, None, f'vision embedding failed: {exc}'
+
+
+def _build_page_embeddings(
+    pages: list[dict[str, Any]],
+    detail_level: str,
+    reference_file: File,
+) -> tuple[list[list[float]], dict[str, Any]]:
+    vectors: list[list[float]] = []
+    embedding_mode = 'rule_features'
+    fallback_reason = None
+    vision_success = False
+    vision_reasons: list[str] = []
+    vision_model_ref = _resolve_vision_model_ref()
+    vision_cache_dir = _resolve_vision_cache_dir()
+
+    for page in pages:
+        vision_vector, vision_mode, vision_reason = _build_vision_embedding_vector(
+            page,
+            detail_level,
+            reference_file,
+            model_ref=vision_model_ref,
+            cache_dir=vision_cache_dir,
+        )
+        if vision_vector is not None:
+            vision_success = True
+            embedding_mode = vision_mode or 'vision_model'
+            vectors.append(_normalize_feature_vector(vision_vector + _page_rule_feature_vector(page, len(pages), detail_level)))
+        else:
+            if vision_reason:
+                vision_reasons.append(vision_reason)
+            vectors.append(_page_rule_feature_vector(page, len(pages), detail_level))
+
+    if not vision_success and vision_reasons:
+        fallback_reason = vision_reasons[0]
+    elif vision_success and vision_reasons:
+        fallback_reason = vision_reasons[0]
+
+    return vectors, {
+        'embedding_mode': embedding_mode if vision_success else 'rule_features',
+        'embedding_source': 'vision+rule' if vision_success else 'rule',
+        'fallback_reason': fallback_reason,
+        'embedding_model_ref': vision_model_ref if vision_success else _DEFAULT_EMBEDDING_MODEL,
+        'embedding_model': _embedding_model_db_value(vision_model_ref, embedding_mode if vision_success else 'rule_features'),
+    }
+
+
+def _cluster_pages_hierarchically(vectors: list[list[float]], target_cluster_count: int) -> tuple[list[int], str | None, str | None]:
+    if len(vectors) <= 1:
+        return [1 for _ in vectors], 'hierarchical', None
+
+    try:
+        import numpy as np
+        scipy_hierarchy = importlib.import_module('scipy.cluster.hierarchy')
+
+        matrix = np.asarray(vectors, dtype=float)
+        if matrix.ndim != 2 or matrix.shape[0] < 2:
+            raise RuntimeError('invalid embedding matrix')
+        linkage = scipy_hierarchy.linkage(matrix, method='ward', metric='euclidean')
+        cluster_count = max(2, min(int(target_cluster_count), matrix.shape[0]))
+        labels = scipy_hierarchy.fcluster(linkage, t=cluster_count, criterion='maxclust')
+        return [int(label) for label in labels.tolist()], 'hierarchical', None
+    except Exception as exc:
+        try:
+            import numpy as np
+            from sklearn.cluster import AgglomerativeClustering
+
+            matrix = np.asarray(vectors, dtype=float)
+            cluster_count = max(2, min(int(target_cluster_count), matrix.shape[0]))
+            model = AgglomerativeClustering(n_clusters=cluster_count)
+            labels = model.fit_predict(matrix)
+            return [int(label) + 1 for label in labels.tolist()], 'hierarchical', None
+        except Exception as fallback_exc:
+            return [], None, f'hierarchical clustering unavailable: {exc}; {fallback_exc}'
+
+
+def _apply_embedding_clusters(
+    pages: list[dict[str, Any]],
+    vectors: list[list[float]],
+    cluster_labels: list[int],
+) -> int:
+    if not cluster_labels:
+        return _assign_cluster_labels(pages)
+
+    unique_labels = sorted({int(label) for label in cluster_labels})
+    label_to_cluster = {label: f'cluster_{index:02d}' for index, label in enumerate(unique_labels, start=1)}
+    for page, label, vector in zip(pages, cluster_labels, vectors):
+        page['cluster_signature'] = {
+            'embedding_head': vector[:8],
+            'source': 'embedding',
+        }
+        page['cluster_label'] = label_to_cluster[int(label)]
+        page['embedding_vector_head'] = vector[:16]
+    return len(unique_labels)
+
+
 def _analyze_pptx_template(reference_file: File, detail_level: str, task_no: str) -> dict[str, Any]:
     file_path = _resolve_reference_path(reference_file)
     if not file_path.exists():
@@ -1091,9 +1414,20 @@ def _analyze_pptx_template(reference_file: File, detail_level: str, task_no: str
             )
 
     llm_meta = _enhance_pptx_pages_with_llm(pages, detail_level, theme_info, reference_file, slide_size, task_no)
-    cluster_count = _assign_cluster_labels(pages)
+    embedding_vectors, embedding_meta = _build_page_embeddings(pages, detail_level, reference_file)
+    cluster_labels, clustering_mode, clustering_fallback_reason = _cluster_pages_hierarchically(
+        embedding_vectors,
+        target_cluster_count=max(2, min(4, len(pages) // 2 or 2)),
+    )
+    if cluster_labels:
+        cluster_count = _apply_embedding_clusters(pages, embedding_vectors, cluster_labels)
+    else:
+        cluster_count = _assign_cluster_labels(pages)
+        clustering_mode = clustering_mode or 'signature'
     page_function_counts = Counter(page['page_function'] for page in pages)
     parse_status = 'ok' if not warnings else 'partial_fallback'
+    fallback_notes = [note for note in [embedding_meta.get('fallback_reason'), clustering_fallback_reason] if note]
+    fallback_reason = '; '.join(fallback_notes) if fallback_notes else None
     analysis_fingerprint = hashlib.sha256(
         _canonical_json(
             {
@@ -1120,6 +1454,10 @@ def _analyze_pptx_template(reference_file: File, detail_level: str, task_no: str
         'slide_size': slide_size,
         'total_pages': len(pages),
         'cluster_count': cluster_count,
+        'embedding_mode': embedding_meta['embedding_mode'],
+        'embedding_source': embedding_meta['embedding_source'],
+        'clustering_mode': clustering_mode or 'signature',
+        'fallback_reason': fallback_reason,
         'page_function_counts': dict(page_function_counts),
         'page_metrics': [
             {
@@ -1164,7 +1502,11 @@ def _analyze_pptx_template(reference_file: File, detail_level: str, task_no: str
         'analysis_warnings': warnings,
         'total_pages': len(pages),
         'cluster_count': cluster_count,
-        'embedding_model': _DEFAULT_EMBEDDING_MODEL,
+        'embedding_model': embedding_meta.get('embedding_model') or _DEFAULT_EMBEDDING_MODEL,
+        'embedding_mode': embedding_meta['embedding_mode'],
+        'embedding_source': embedding_meta['embedding_source'],
+        'clustering_mode': clustering_mode or 'signature',
+        'fallback_reason': fallback_reason,
         'llm_model': llm_meta['llm_model'],
         'llm_enhanced': llm_meta['llm_enhanced'],
         'llm_error': llm_meta['llm_error'],
@@ -1234,6 +1576,10 @@ def _build_fallback_analysis(reference_file: File, detail_level: str, task_no: s
         'fallback_reason': reason,
         'total_pages': len(pages),
         'cluster_count': cluster_count,
+        'embedding_mode': 'rule_features',
+        'embedding_source': 'rule',
+        'clustering_mode': 'signature',
+        'fallback_reason': reason,
         'page_function_counts': dict(page_function_counts),
         'page_metrics': [
             {
@@ -1273,6 +1619,10 @@ def _build_fallback_analysis(reference_file: File, detail_level: str, task_no: s
         'total_pages': len(pages),
         'cluster_count': cluster_count,
         'embedding_model': _DEFAULT_EMBEDDING_MODEL,
+        'embedding_mode': 'rule_features',
+        'embedding_source': 'rule',
+        'clustering_mode': 'signature',
+        'fallback_reason': reason,
         'llm_model': llm_model,
         'llm_enhanced': False,
         'llm_error': None,

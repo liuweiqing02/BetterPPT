@@ -1,11 +1,96 @@
 from __future__ import annotations
 
+import os
 import unittest
 
-from app.workers.runner import _build_image_asset, _build_table_asset, _inject_slide_assets
+os.environ.setdefault('DATABASE_URL', 'sqlite+pysqlite:///:memory:')
+
+from app.workers.runner import (
+    _build_image_asset,
+    _build_slot_fill_value,
+    _build_table_asset,
+    _determine_slot_fill_status,
+    _inject_slide_assets,
+)
 
 
 class RunnerAssetProjectionTestCase(unittest.TestCase):
+    def test_build_slot_fill_value_prefers_parsed_image_asset(self) -> None:
+        slide = {'page_no': 2, 'title': 'Market Overview', 'bullets': ['A', 'B']}
+        slot = {'slot_type': 'image', 'slot_role': 'figure'}
+        cursor_state = {'image_index': 0}
+        parsed_images = [
+            {'page_no': 2, 'image_path': '/tmp/p2_1.png', 'caption': 'P2 image', 'alt_text': 'P2 image alt'},
+            {'page_no': 3, 'image_path': '/tmp/p3_1.png', 'caption': 'P3 image', 'alt_text': 'P3 image alt'},
+        ]
+
+        planned = _build_slot_fill_value(
+            slide,
+            slot,
+            parsed_images=parsed_images,
+            parsed_tables=[],
+            asset_cursor_state=cursor_state,
+        )
+
+        self.assertEqual(planned['source'], 'doc_image')
+        self.assertEqual(planned['hint']['image_path'], '/tmp/p2_1.png')
+        self.assertEqual(planned['hint']['caption'], 'P2 image')
+        self.assertEqual(cursor_state['image_index'], 1)
+
+    def test_build_slot_fill_value_prefers_parsed_table_asset(self) -> None:
+        slide = {'page_no': 3, 'title': 'Revenue', 'bullets': ['A', 'B']}
+        slot = {'slot_type': 'table', 'slot_role': 'datatable'}
+        cursor_state = {'table_index': 0}
+        parsed_tables = [
+            {'page_no': 3, 'title': 'Revenue Table', 'headers': ['Year', 'Value'], 'rows': [['2024', '10']]},
+        ]
+
+        planned = _build_slot_fill_value(
+            slide,
+            slot,
+            parsed_images=[],
+            parsed_tables=parsed_tables,
+            asset_cursor_state=cursor_state,
+        )
+
+        self.assertEqual(planned['source'], 'doc_table')
+        self.assertEqual(planned['hint']['title'], 'Revenue Table')
+        self.assertEqual(planned['hint']['headers'], ['Year', 'Value'])
+        self.assertEqual(planned['hint']['rows'], [['2024', '10']])
+        self.assertEqual(cursor_state['table_index'], 1)
+
+    def test_determine_slot_fill_status_marks_asset_backed_image_table_as_success(self) -> None:
+        image_status = _determine_slot_fill_status(
+            slot_type='image',
+            planned_value={'source': 'doc_image', 'hint': {'image_path': '/tmp/p1.png', 'caption': 'cap'}},
+            template_mapping_fallback_level=0,
+        )
+        table_status = _determine_slot_fill_status(
+            slot_type='table',
+            planned_value={'source': 'doc_table', 'hint': {'headers': ['h1'], 'rows': [['v1']]}},
+            template_mapping_fallback_level=0,
+        )
+
+        self.assertEqual(image_status[0], 'success')
+        self.assertEqual(table_status[0], 'success')
+        self.assertGreaterEqual(image_status[1], 0.9)
+        self.assertGreaterEqual(table_status[1], 0.9)
+
+    def test_determine_slot_fill_status_marks_fallback_assets(self) -> None:
+        image_status = _determine_slot_fill_status(
+            slot_type='image',
+            planned_value={'source': 'doc_image', 'hint': 'image_for_slide_1'},
+            template_mapping_fallback_level=0,
+        )
+        table_status = _determine_slot_fill_status(
+            slot_type='table',
+            planned_value={'source': 'doc_table', 'hint': ['A', 'B']},
+            template_mapping_fallback_level=0,
+        )
+
+        self.assertEqual(image_status[0], 'fallback')
+        self.assertEqual(table_status[0], 'fallback')
+
     def test_build_table_asset_from_list_of_dicts_infers_headers_and_rows(self) -> None:
         asset = _build_table_asset(
             {

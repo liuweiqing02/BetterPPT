@@ -30,6 +30,17 @@ python --version
 
 2. Configure env file from `.env.example` and keep it out of VCS.
 
+For stable task latency in release environment, tune:
+- `LLM_REQUEST_TIMEOUT_SECONDS` (recommended `10-20`)
+- `LLM_REQUEST_MAX_RETRIES` (recommended `0-1`)
+
+Optional for V1.2 template vision embedding (offline/local model):
+
+```powershell
+cd <repo-root>
+source\backend\.venv\Scripts\python.exe bin\setup_local_vision_model.py
+```
+
 3. Initialize DB schema.
 
 Option A: start API once with auto table create.

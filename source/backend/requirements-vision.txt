@@ -1,0 +1,6 @@
+transformers>=4.43,<5
+huggingface-hub>=0.24,<1
+numpy>=1.26,<3
+scipy>=1.11,<2
+scikit-learn>=1.4,<2
+Pillow>=10,<12

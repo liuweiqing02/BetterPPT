@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import sys
 from types import SimpleNamespace
 import tempfile
@@ -24,6 +25,7 @@ if 'app.services' not in sys.modules:
     services_pkg.__path__ = [str(_SERVICES_DIR)]  # type: ignore[attr-defined]
     sys.modules['app.services'] = services_pkg
 
+from app.services import template_service as template_service_module
 from app.services.template_service import analyze_and_persist_template, analyze_template
 
 _GENERATED_REF_DIR: tempfile.TemporaryDirectory[str] | None = None
@@ -101,8 +103,31 @@ class TemplateServiceTestCase(unittest.TestCase):
     def test_analyze_template_returns_pages_with_complete_fields_for_real_pptx(self) -> None:
         with self._make_session() as db:
             reference_file = self._create_reference_file(db)
+            settings = get_settings().model_copy(update={'llm_api_key': ''})
 
-            result = analyze_template(reference_file, detail_level='balanced', task_no='unit-template-analyze')
+            def _fake_embeddings(pages, detail_level, reference_file):
+                return (
+                    [[0.1, 0.2, 0.3] for _ in pages],
+                    {'embedding_mode': 'rule_features', 'embedding_source': 'rule', 'fallback_reason': None},
+                )
+
+            def _fake_cluster(vectors, target_cluster_count):
+                labels = [1 if index < max(1, len(vectors) // 2) else 2 for index, _ in enumerate(vectors)]
+                return labels, 'hierarchical', None
+
+            with patch.object(
+                template_service_module,
+                '_build_page_embeddings',
+                side_effect=_fake_embeddings,
+            ), patch.object(
+                template_service_module,
+                '_cluster_pages_hierarchically',
+                side_effect=_fake_cluster,
+            ), patch(
+                'app.services.template_service.get_settings',
+                return_value=settings,
+            ):
+                result = analyze_template(reference_file, detail_level='balanced', task_no='unit-template-analyze')
             pages = result['pages']
 
             self.assertGreater(len(pages), 0)
@@ -127,13 +152,36 @@ class TemplateServiceTestCase(unittest.TestCase):
     def test_analyze_and_persist_template_writes_profile_and_page_schemas(self) -> None:
         with self._make_session() as db:
             reference_file = self._create_reference_file(db)
+            settings = get_settings().model_copy(update={'llm_api_key': ''})
 
-            result = analyze_and_persist_template(
-                db,
-                reference_file=reference_file,
-                detail_level='detailed',
-                task_no='unit-template-persist',
-            )
+            def _fake_embeddings(pages, detail_level, reference_file):
+                return (
+                    [[0.1, 0.2, 0.3] for _ in pages],
+                    {'embedding_mode': 'rule_features', 'embedding_source': 'rule', 'fallback_reason': None},
+                )
+
+            def _fake_cluster(vectors, target_cluster_count):
+                labels = [1 if index < max(1, len(vectors) // 2) else 2 for index, _ in enumerate(vectors)]
+                return labels, 'hierarchical', None
+
+            with patch.object(
+                template_service_module,
+                '_build_page_embeddings',
+                side_effect=_fake_embeddings,
+            ), patch.object(
+                template_service_module,
+                '_cluster_pages_hierarchically',
+                side_effect=_fake_cluster,
+            ), patch(
+                'app.services.template_service.get_settings',
+                return_value=settings,
+            ):
+                result = analyze_and_persist_template(
+                    db,
+                    reference_file=reference_file,
+                    detail_level='detailed',
+                    task_no='unit-template-persist',
+                )
 
             profile = db.scalar(select(TemplateProfile).where(TemplateProfile.id == result['profile_id']))
             self.assertIsNotNone(profile)
@@ -173,8 +221,26 @@ class TemplateServiceTestCase(unittest.TestCase):
             fake_llm_module = ModuleType('app.services.llm_service')
             fake_llm_module.call_chat_completions = mock_call  # type: ignore[attr-defined]
 
+            def _fake_embeddings(pages, detail_level, reference_file):
+                return (
+                    [[0.1, 0.2, 0.3] for _ in pages],
+                    {'embedding_mode': 'rule_features', 'embedding_source': 'rule', 'fallback_reason': None},
+                )
+
+            def _fake_cluster(vectors, target_cluster_count):
+                labels = [1 if index < max(1, len(vectors) // 2) else 2 for index, _ in enumerate(vectors)]
+                return labels, 'hierarchical', None
+
             with patch.dict(sys.modules, {'app.services.llm_service': fake_llm_module}), patch(
                 'app.services.template_service.get_settings', return_value=settings
+            ), patch.object(
+                template_service_module,
+                '_build_page_embeddings',
+                side_effect=_fake_embeddings,
+            ), patch.object(
+                template_service_module,
+                '_cluster_pages_hierarchically',
+                side_effect=_fake_cluster,
             ):
                 result = analyze_template(reference_file, detail_level='balanced', task_no='unit-template-llm-off')
 
@@ -213,8 +279,26 @@ class TemplateServiceTestCase(unittest.TestCase):
             fake_llm_module = ModuleType('app.services.llm_service')
             fake_llm_module.call_chat_completions = mock_call  # type: ignore[attr-defined]
 
+            def _fake_embeddings(pages, detail_level, reference_file):
+                return (
+                    [[0.1, 0.2, 0.3] for _ in pages],
+                    {'embedding_mode': 'rule_features', 'embedding_source': 'rule', 'fallback_reason': None},
+                )
+
+            def _fake_cluster(vectors, target_cluster_count):
+                labels = [1 if index < max(1, len(vectors) // 2) else 2 for index, _ in enumerate(vectors)]
+                return labels, 'hierarchical', None
+
             with patch.dict(sys.modules, {'app.services.llm_service': fake_llm_module}), patch(
                 'app.services.template_service.get_settings', return_value=settings
+            ), patch.object(
+                template_service_module,
+                '_build_page_embeddings',
+                side_effect=_fake_embeddings,
+            ), patch.object(
+                template_service_module,
+                '_cluster_pages_hierarchically',
+                side_effect=_fake_cluster,
             ):
                 result = analyze_template(reference_file, detail_level='balanced', task_no='unit-template-llm-on')
 
@@ -230,6 +314,107 @@ class TemplateServiceTestCase(unittest.TestCase):
             self.assertEqual(first_page['layout_schema_json']['layout_rules']['title_style'], 'hero')
             self.assertEqual(first_page['style_tokens_json']['accent_strategy'], 'brand_strip')
             self.assertGreaterEqual(mock_call.call_count, 1)
+
+    def test_analyze_template_records_embedding_and_clustering_modes_when_optional_dependencies_work(self) -> None:
+        with self._make_session() as db:
+            reference_file = self._create_reference_file(db)
+            settings = get_settings().model_copy(update={'llm_api_key': ''})
+
+            def _fake_embeddings(pages, detail_level, reference_file):
+                vectors = [[float(index + 1), 0.5, 0.25] for index, _ in enumerate(pages)]
+                return vectors, {
+                    'embedding_mode': 'vision_model',
+                    'embedding_source': 'vision+rule',
+                    'fallback_reason': None,
+                }
+
+            def _fake_cluster(vectors, target_cluster_count):
+                labels = [1 if index < max(1, len(vectors) // 2) else 2 for index, _ in enumerate(vectors)]
+                return labels, 'hierarchical', None
+
+            with patch.object(template_service_module, '_build_page_embeddings', side_effect=_fake_embeddings), patch.object(
+                template_service_module, '_cluster_pages_hierarchically', side_effect=_fake_cluster
+            ), patch('app.services.template_service.get_settings', return_value=settings):
+                result = analyze_template(reference_file, detail_level='balanced', task_no='unit-template-modes')
+
+            self.assertEqual(result['embedding_mode'], 'vision_model')
+            self.assertEqual(result['embedding_source'], 'vision+rule')
+            self.assertEqual(result['clustering_mode'], 'hierarchical')
+            self.assertIsNone(result['fallback_reason'])
+            self.assertEqual(result['summary_json']['embedding_mode'], 'vision_model')
+            self.assertEqual(result['summary_json']['clustering_mode'], 'hierarchical')
+            self.assertIsNone(result['summary_json']['fallback_reason'])
+            self.assertGreaterEqual(result['cluster_count'], 1)
+            self.assertGreater(len(result['pages']), 0)
+
+    def test_analyze_template_records_signature_fallback_when_optional_dependencies_are_missing(self) -> None:
+        with self._make_session() as db:
+            reference_file = self._create_reference_file(db)
+            settings = get_settings().model_copy(update={'llm_api_key': ''})
+
+            with patch.object(
+                template_service_module,
+                '_build_page_embeddings',
+                return_value=(
+                    [[0.1, 0.2, 0.3] for _ in range(2)],
+                    {
+                        'embedding_mode': 'rule_features',
+                        'embedding_source': 'rule',
+                        'fallback_reason': 'vision embedding failed: unavailable',
+                    },
+                ),
+            ), patch.object(
+                template_service_module,
+                '_cluster_pages_hierarchically',
+                return_value=([], None, 'hierarchical clustering unavailable: scipy missing'),
+            ), patch('app.services.template_service.get_settings', return_value=settings):
+                result = analyze_template(reference_file, detail_level='balanced', task_no='unit-template-fallback')
+
+            self.assertEqual(result['embedding_mode'], 'rule_features')
+            self.assertEqual(result['embedding_source'], 'rule')
+            self.assertEqual(result['clustering_mode'], 'signature')
+            self.assertIn('vision embedding failed', result['fallback_reason'])
+            self.assertIn('hierarchical clustering unavailable', result['fallback_reason'])
+            self.assertEqual(result['summary_json']['embedding_mode'], 'rule_features')
+            self.assertEqual(result['summary_json']['clustering_mode'], 'signature')
+            self.assertIn('vision embedding failed', result['summary_json']['fallback_reason'])
+
+    def test_resolve_vision_model_ref_prefers_local_model_path_env(self) -> None:
+        with tempfile.TemporaryDirectory(prefix='vision-local-model-') as tempdir:
+            local_model = Path(tempdir).resolve()
+            mocked_settings = SimpleNamespace(
+                template_vision_model='google/vit-base-patch16-224-in21k',
+                template_vision_model_path='',
+                template_vision_cache_dir='',
+            )
+            with patch.object(template_service_module, 'get_settings', return_value=mocked_settings), patch.dict(
+                os.environ,
+                {
+                    'BETTERPPT_TEMPLATE_VISION_MODEL_PATH': str(local_model),
+                    'BETTERPPT_TEMPLATE_VISION_MODEL': 'google/vit-base-patch16-224-in21k',
+                },
+            ):
+                resolved = template_service_module._resolve_vision_model_ref()
+        self.assertEqual(resolved, str(local_model))
+
+    def test_resolve_vision_model_ref_falls_back_to_model_id(self) -> None:
+        mocked_settings = SimpleNamespace(
+            template_vision_model='google/vit-base-patch16-224-in21k',
+            template_vision_model_path='',
+            template_vision_cache_dir='',
+        )
+        with patch.dict(
+            os.environ,
+            {
+                'BETTERPPT_TEMPLATE_VISION_MODEL_PATH': '',
+                'BETTERPPT_TEMPLATE_VISION_MODEL': 'google/vit-base-patch16-224-in21k',
+            },
+            clear=False,
+        ), patch.object(template_service_module, '_DEFAULT_VISION_LOCAL_DIR', Path('Z:/_not_exist_model_dir_')), patch.object(
+            template_service_module, 'get_settings', return_value=mocked_settings
+        ):
+            resolved = template_service_module._resolve_vision_model_ref()
+        self.assertEqual(resolved, 'google/vit-base-patch16-224-in21k')
 
 
 if __name__ == '__main__':

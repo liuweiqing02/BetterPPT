@@ -12,6 +12,7 @@ from app.schemas.common import APIResponse
 from app.schemas.file import CompleteUploadRequest, FileData, FileDeleteData, UploadUrlData, UploadUrlRequest
 from app.services.file_service import (
     complete_upload,
+    verify_download_signature,
     delete_file,
     create_upload_slot,
     get_file_by_id,
@@ -80,12 +81,26 @@ def post_complete_upload(
 @router.get('/download/{file_id}')
 def download_file(
     file_id: int,
+    uid: int | None = None,
+    exp: int | None = None,
+    sig: str | None = None,
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> FileResponse:
     file = get_file_by_id(db, file_id)
-    if not file or file.user_id != current_user.id:
+    if not file:
         raise AppException(status_code=404, code=1002, message='file not found')
+
+    signed_ok = False
+    if uid is not None:
+        if int(uid) != int(file.user_id):
+            raise AppException(status_code=403, code=1001, message='invalid signed download user')
+        signed_ok = verify_download_signature(file_id=file.id, user_id=file.user_id, exp=exp, sig=sig)
+
+    if not signed_ok and file.user_id != current_user.id:
+        raise AppException(status_code=404, code=1002, message='file not found')
+    if not signed_ok and (uid is not None or exp is not None or sig is not None):
+        raise AppException(status_code=403, code=1001, message='invalid or expired signed download url')
 
     file_path: Path = open_local_file(file)
     return FileResponse(path=str(file_path), filename=file.filename, media_type=file.mime_type or 'application/octet-stream')

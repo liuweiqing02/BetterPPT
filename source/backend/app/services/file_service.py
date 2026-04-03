@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -42,6 +44,43 @@ def _default_retention_expire_at(days: int) -> datetime:
 
 def _now_naive_utc() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _download_signature(file_id: int, user_id: int, expires_at: int) -> str:
+    settings = get_settings()
+    payload = f'{int(file_id)}:{int(user_id)}:{int(expires_at)}'.encode('utf-8')
+    secret = (settings.signed_url_secret or 'dev_signed_url_secret').encode('utf-8')
+    return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+
+def build_signed_download_url(
+    *,
+    base_url: str,
+    file_id: int,
+    user_id: int,
+    expires_in: int | None = None,
+) -> str:
+    settings = get_settings()
+    ttl = int(expires_in or settings.signed_url_ttl_seconds or 3600)
+    ttl = max(30, min(ttl, 24 * 3600))
+    expires_at = int(datetime.now(timezone.utc).timestamp()) + ttl
+    sig = _download_signature(file_id=file_id, user_id=user_id, expires_at=expires_at)
+    query = urlencode({'uid': int(user_id), 'exp': expires_at, 'sig': sig})
+    return f"{base_url}/api/v1/files/download/{int(file_id)}?{query}"
+
+
+def verify_download_signature(*, file_id: int, user_id: int, exp: int | None, sig: str | None) -> bool:
+    if exp is None or not sig:
+        return False
+    try:
+        expires_at = int(exp)
+    except Exception:
+        return False
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    if expires_at < now_ts:
+        return False
+    expected = _download_signature(file_id=file_id, user_id=user_id, expires_at=expires_at)
+    return hmac.compare_digest(expected, str(sig))
 
 
 def _delete_local_file(storage_path: str | None) -> bool:

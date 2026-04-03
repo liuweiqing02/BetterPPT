@@ -26,6 +26,8 @@ class TaskSummary(BaseSchema):
     current_step: str | None = None
     progress: int
     detail_level: str
+    rag_enabled: bool = False
+    user_prompt: str | None = None
     page_count_estimated: int | None = None
     page_count_final: int | None = None
     error_code: str | None = None
@@ -108,6 +110,20 @@ class TaskQualityReportData(BaseSchema):
     locked_page_ratio: float | None = None
     evaluated_scope_json: dict[str, Any] | None = None
     report_json: dict[str, Any] | None = None
+
+
+class TaskObservabilityData(BaseSchema):
+    task_no: str
+    detail_level: str
+    rag_enabled: bool
+    user_prompt: str | None = None
+    latest_attempt_no: int | None = None
+    prompt_observability: dict[str, Any] = Field(default_factory=dict)
+    rag_observability: dict[str, Any] = Field(default_factory=dict)
+    generation_observability: dict[str, Any] = Field(default_factory=dict)
+    quality_observability: dict[str, Any] = Field(default_factory=dict)
+    step_sources: dict[str, str] = Field(default_factory=dict)
+    step_audits: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class PreviewSlide(BaseSchema):
