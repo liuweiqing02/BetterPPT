@@ -1,5 +1,18 @@
 ﻿# CHANGELOG
 
+## [v0.1.2] - 2026-04-03
+
+### Added
+- 新增前端 MVP 四页面流：任务创建、任务列表、任务详情（进度+日志）、结果预览与下载。
+- 新增旧版单页联调入口：`/legacy.html`，用于平滑迁移。
+- 新增上传约束接口：`GET /api/v1/files/upload-constraints`。
+- 新增并发活跃窗口配置：`TASK_CONCURRENCY_ACTIVE_WINDOW_MINUTES`，避免历史僵尸任务长期占用并发额度。
+
+### Changed
+- 任务详情契约扩展：`fallback_state/fallback_attempt_no`。
+- 回退事件标准化：`fallback_started/fallback_finished/fallback_failed`。
+- README 与 DEPLOYMENT 同步更新到 `v0.1.2` 交付口径与部署说明。
+
 ## [V1.2.4] - 2026-04-03
 
 ### Fixed

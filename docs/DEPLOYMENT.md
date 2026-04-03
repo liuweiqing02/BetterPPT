@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document describes practical deployment options for BetterPPT v0.1.0.
+This document describes practical deployment options for BetterPPT v0.1.2.
 
 ## Mode A: Internal Repository / Internal Environment (Recommended First)
 
@@ -33,6 +33,9 @@ python --version
 For stable task latency in release environment, tune:
 - `LLM_REQUEST_TIMEOUT_SECONDS` (recommended `10-20`)
 - `LLM_REQUEST_MAX_RETRIES` (recommended `0-1`)
+- `TASK_CONCURRENCY_PER_USER` (recommended `3`)
+- `TASK_CONCURRENCY_ACTIVE_WINDOW_MINUTES` (recommended `120`)
+- `UPLOAD_PDF_MAX_FILE_SIZE_MB` / `UPLOAD_REFERENCE_PPT_MAX_FILE_SIZE_MB`
 
 Optional for V1.2 template vision embedding (offline/local model):
 
@@ -59,10 +62,28 @@ cd source/backend
 .\.venv\Scripts\python -m app.workers.runner
 ```
 
-5. Run smoke tests.
+5. Start frontend static server (MVP UI).
+
+```powershell
+cd source/frontend
+python -m http.server 5173
+```
+
+Routing convention in v0.1.2:
+- frontend views: `/app/*` (or `index.html#/app/*` in static mode)
+- backend API: `/api/v1/*`
+- legacy debug page: `/legacy.html`
+
+6. Run smoke tests.
 
 ```powershell
 .\bin\pre_release_precheck.ps1 -SkipE2E
+```
+
+For formal release gate, run without `-SkipE2E`:
+
+```powershell
+.\bin\pre_release_precheck.ps1
 ```
 
 ## Mode B: Public Open-Source Repository
@@ -99,5 +120,5 @@ Recommended additions:
 ## Rollback Suggestions
 
 - Keep previous application package for quick rollback.
-- Use immutable version tags (`v0.1.0`, `v0.1.1`) and do not rewrite tags.
+- Use immutable version tags (`v0.1.0`, `v0.1.1`, `v0.1.2`) and do not rewrite tags.
 - For schema changes, keep backward-compatible migration windows where possible.

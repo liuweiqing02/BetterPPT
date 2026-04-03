@@ -1,6 +1,6 @@
 ﻿# BetterPPT
 
-BetterPPT 是一个模板驱动的 PDF -> PPT 自动生成系统。项目当前处于 **v0.1.0（首个可交付版本）**，已经具备本地运行、回归测试与基础协作开发能力。
+BetterPPT 是一个模板驱动的 PDF -> PPT 自动生成系统。项目当前处于 **v0.1.2（V1.2.4 对齐交付版）**，已具备本地运行、发布门禁回归、以及 MVP 用户端页面流程。
 
 ## 项目解决的问题
 
@@ -83,7 +83,7 @@ cd source/backend
 .\.venv\Scripts\python -m app.workers.runner
 ```
 
-### 6) 启动前端联调页（新终端）
+### 6) 启动前端页面（新终端）
 
 ```powershell
 cd source/frontend
@@ -91,6 +91,9 @@ python -m http.server 5173
 ```
 
 打开 `http://127.0.0.1:5173`。
+
+- 主入口（MVP 四页面流）：`/`（内部按 `/app/*` 视图切换）
+- 旧版单页联调入口：`/legacy.html`
 
 ## 环境变量说明
 
@@ -152,7 +155,7 @@ source\backend\.venv\Scripts\python.exe -m pytest source\backend\tests\unit -q
 ├─ref/                     # 本地测试样例（默认不建议公开提交）
 ├─source/
 │  ├─backend/              # FastAPI + worker + tests + migrations
-│  └─frontend/             # 最小联调页面
+│  └─frontend/             # 用户端 MVP 页面 + 旧版联调页
 ├─.env.example
 ├─.gitignore
 └─README.md
@@ -161,12 +164,13 @@ source\backend\.venv\Scripts\python.exe -m pytest source\backend\tests\unit -q
 ## 版本说明
 
 - 首版发布说明见 [docs/RELEASE_NOTES_v0.1.0.md](./docs/RELEASE_NOTES_v0.1.0.md)
+- 当前交付版本：`v0.1.2`（多页面前端、上传约束接口、回退状态契约）
 - 文档版本变更见 [docs/CHANGELOG.md](./docs/CHANGELOG.md)
 
 ## 已知问题
 
 - 当前鉴权默认支持开发态匿名用户（`user_id=1`），生产环境需要改为真实鉴权体系。
-- 前端为调试联调页，尚未建设完整产品化 UI。
+- 当前前端为 MVP 用户端页面（创建/列表/详情/预览下载），非最终产品化视觉版本。
 - 部分回归脚本依赖 `ref/` 下本地样例文件；公开仓库建议提供可再分发的示例素材。
 
 ## 后续计划
