@@ -3131,6 +3131,19 @@ def process_single_task(db: Session, task: Task) -> None:
                             add_task_event(
                                 db,
                                 task_id=task.id,
+                                event_type=TaskEventType.FALLBACK_STARTED,
+                                message='fallback flow started from slot mapping',
+                                payload_json={
+                                    'from_step': TaskStepCode.MAP_SLOTS,
+                                    'to_step': TaskStepCode.GENERATE_SLIDES,
+                                    'fallback_level': max_fallback_level,
+                                    'reason_code': 'TEMPLATE_SLOT_FALLBACK',
+                                    'attempt_no': step_attempt_no,
+                                },
+                            )
+                            add_task_event(
+                                db,
+                                task_id=task.id,
                                 event_type=TaskEventType.WARNING,
                                 message='slot mapping fallback planned',
                                 payload_json={
@@ -3280,6 +3293,13 @@ def process_single_task(db: Session, task: Task) -> None:
                         add_task_event(
                             db,
                             task_id=task.id,
+                            event_type=TaskEventType.FALLBACK_STARTED,
+                            message='fallback retry started',
+                            payload_json=payload,
+                        )
+                        add_task_event(
+                            db,
+                            task_id=task.id,
                             event_type=TaskEventType.WARNING,
                             message='layout self-correct failed, fallback retry scheduled',
                             payload_json=payload,
@@ -3292,6 +3312,13 @@ def process_single_task(db: Session, task: Task) -> None:
                     task.error_code = '2105'
                     task.error_message = str(exc)
                     task.finished_at = datetime.utcnow()
+                    add_task_event(
+                        db,
+                        task_id=task.id,
+                        event_type=TaskEventType.FALLBACK_FAILED,
+                        message='fallback retry failed',
+                        payload_json=payload,
+                    )
                     add_task_event(
                         db,
                         task_id=task.id,
@@ -3351,6 +3378,17 @@ def process_single_task(db: Session, task: Task) -> None:
                 'fallback_used': int(task.fallback_used or 0),
             },
         )
+        if int(task.fallback_used or 0) > 0:
+            add_task_event(
+                db,
+                task_id=task.id,
+                event_type=TaskEventType.FALLBACK_FINISHED,
+                message='fallback flow finished',
+                payload_json={
+                    'attempt_no': final_attempt_no,
+                    'result': 'succeeded',
+                },
+            )
         cache_task_progress(
             task.task_no,
             {'status': task.status, 'current_step': '', 'progress': 100, 'updated_at': datetime.utcnow().isoformat()},

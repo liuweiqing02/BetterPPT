@@ -4,12 +4,13 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.core.config import get_settings
-from app.core.constants import FileRole, TaskStatus
+from app.core.constants import FileRole, TaskEventType, TaskStatus
 from app.core.errors import AppException
 from app.core.security import CurrentUser
 from app.db.session import get_db
 from app.models.file import File
 from app.models.task import Task
+from app.models.task_event import TaskEvent
 from app.models.task_step import TaskStep
 from app.schemas.common import APIResponse
 from app.schemas.task import (
@@ -48,12 +49,54 @@ from app.services.task_service import (
 router = APIRouter(prefix='/tasks', tags=['tasks'])
 
 
-def _task_summary(task) -> TaskSummary:
+def _resolve_fallback_state(db: Session, task: Task) -> tuple[str, int | None]:
+    fallback_types = (
+        TaskEventType.FALLBACK_STARTED.value,
+        TaskEventType.FALLBACK_FINISHED.value,
+        TaskEventType.FALLBACK_FAILED.value,
+    )
+    event = db.scalar(
+        select(TaskEvent)
+        .where(TaskEvent.task_id == task.id, TaskEvent.event_type.in_(fallback_types))
+        .order_by(TaskEvent.id.desc())
+        .limit(1)
+    )
+
+    if event:
+        payload = event.payload_json if isinstance(event.payload_json, dict) else {}
+        attempt_no: int | None = None
+        try:
+            if payload.get('attempt_no') is not None:
+                attempt_no = max(1, int(payload.get('attempt_no')))
+        except Exception:
+            attempt_no = None
+        mapping = {
+            TaskEventType.FALLBACK_STARTED.value: 'running',
+            TaskEventType.FALLBACK_FINISHED.value: 'succeeded',
+            TaskEventType.FALLBACK_FAILED.value: 'failed',
+        }
+        return mapping.get(event.event_type, 'none'), attempt_no
+
+    if int(task.fallback_used or 0) <= 0:
+        return 'none', None
+    if task.status == TaskStatus.SUCCEEDED:
+        return 'succeeded', None
+    if task.status == TaskStatus.FAILED:
+        return 'failed', None
+    if task.status in {TaskStatus.CREATED, TaskStatus.VALIDATING, TaskStatus.QUEUED, TaskStatus.RUNNING}:
+        return 'running', None
+    return 'none', None
+
+
+def _task_summary(db: Session, task) -> TaskSummary:
+    fallback_state, fallback_attempt_no = _resolve_fallback_state(db, task)
     return TaskSummary(
         task_no=task.task_no,
         status=task.status,
         current_step=task.current_step,
         progress=task.progress,
+        fallback_state=fallback_state,
+        fallback_attempt_no=fallback_attempt_no,
         detail_level=task.detail_level,
         rag_enabled=bool(task.rag_enabled),
         user_prompt=task.user_prompt,
@@ -207,7 +250,7 @@ def get_tasks(
     current_user: CurrentUser = Depends(get_current_user),
 ) -> APIResponse:
     tasks = list_tasks(db, user_id=current_user.id, limit=limit)
-    items = [_task_summary(task) for task in tasks]
+    items = [_task_summary(db, task) for task in tasks]
     return APIResponse(data=TaskListData(items=items))
 
 
@@ -218,7 +261,7 @@ def get_task_detail(
     current_user: CurrentUser = Depends(get_current_user),
 ) -> APIResponse:
     task = get_task_by_no(db, user_id=current_user.id, task_no=task_no)
-    return APIResponse(data=_task_summary(task))
+    return APIResponse(data=_task_summary(db, task))
 
 
 @router.get('/{task_no}/events', response_model=APIResponse)
@@ -247,7 +290,7 @@ def get_task_replay_view(
 ) -> APIResponse:
     task, steps, events, next_cursor = get_task_replay(db, user_id=current_user.id, task_no=task_no, limit=limit)
     data = TaskReplayData(
-        task=_task_summary(task),
+        task=_task_summary(db, task),
         steps=[TaskReplayStepData.model_validate(step) for step in steps],
         events=[TaskEventData.model_validate(event) for event in events],
         next_cursor=next_cursor,

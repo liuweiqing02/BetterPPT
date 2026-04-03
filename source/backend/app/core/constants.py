@@ -45,6 +45,9 @@ class TaskEventType(StrEnum):
     STEP_LOG = 'step_log'
     WARNING = 'warning'
     ERROR = 'error'
+    FALLBACK_STARTED = 'fallback_started'
+    FALLBACK_FINISHED = 'fallback_finished'
+    FALLBACK_FAILED = 'fallback_failed'
 
 
 DETAIL_LEVEL_PAGE_RANGE: dict[str, tuple[int, int]] = {

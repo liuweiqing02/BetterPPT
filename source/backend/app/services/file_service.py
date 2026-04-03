@@ -124,6 +124,32 @@ def _validate_type(filename: str, file_role: str, mime_type: str) -> None:
         raise AppException(status_code=400, code=1003, message='unsupported mime type')
 
 
+def _max_file_size_bytes(file_role: str) -> int:
+    settings = get_settings()
+    role = FileRole(file_role)
+    if role == FileRole.PDF_SOURCE:
+        return max(1, int(settings.upload_pdf_max_file_size_mb or 100)) * 1024 * 1024
+    if role == FileRole.PPT_REFERENCE:
+        return max(1, int(settings.upload_reference_ppt_max_file_size_mb or 100)) * 1024 * 1024
+    return 100 * 1024 * 1024
+
+
+def get_upload_constraints() -> dict[str, Any]:
+    settings = get_settings()
+    return {
+        'pdf': {
+            'allowed_ext': sorted(ext.lstrip('.') for ext in _ALLOWED_EXT[FileRole.PDF_SOURCE]),
+            'max_file_size_mb': int(settings.upload_pdf_max_file_size_mb or 100),
+            'max_pages': int(settings.upload_pdf_max_pages or 300),
+        },
+        'reference_ppt': {
+            'allowed_ext': sorted(ext.lstrip('.') for ext in _ALLOWED_EXT[FileRole.PPT_REFERENCE]),
+            'max_file_size_mb': int(settings.upload_reference_ppt_max_file_size_mb or 100),
+            'max_pages': int(settings.upload_reference_ppt_max_pages or 200),
+        },
+    }
+
+
 def _build_scan_report(
     file: File,
     *,
@@ -252,6 +278,19 @@ def create_upload_slot(
 ) -> tuple[File, dict[str, str]]:
     role = _normalize_role(file_role)
     _validate_type(filename, role, content_type)
+    if int(file_size or 0) <= 0:
+        raise AppException(status_code=400, code=1001, message='invalid file size')
+    max_size_bytes = _max_file_size_bytes(role)
+    if int(file_size) > max_size_bytes:
+        raise AppException(
+            status_code=400,
+            code=1001,
+            message='file size exceeds limit',
+            data={
+                'max_file_size_mb': max_size_bytes // (1024 * 1024),
+                'file_size': int(file_size),
+            },
+        )
 
     settings = get_settings()
     ext = Path(filename).suffix.lower()

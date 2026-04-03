@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from random import randint
 from typing import Any
 
@@ -120,6 +120,38 @@ def _check_create_task_rate_limit(user_id: int) -> None:
         )
 
 
+def _check_create_task_concurrency_limit(db: Session, user_id: int) -> None:
+    settings = get_settings()
+    limit = int(settings.task_concurrency_per_user or 0)
+    if limit <= 0:
+        return
+    active_window_minutes = max(1, int(settings.task_concurrency_active_window_minutes or 120))
+    active_cutoff = datetime.utcnow() - timedelta(minutes=active_window_minutes)
+    running_like = {
+        TaskStatus.CREATED,
+        TaskStatus.VALIDATING,
+        TaskStatus.QUEUED,
+        TaskStatus.RUNNING,
+    }
+    current = int(
+        db.scalar(
+            select(func.count(Task.id)).where(
+                Task.user_id == user_id,
+                Task.status.in_(running_like),
+                Task.updated_at >= active_cutoff,
+            )
+        )
+        or 0
+    )
+    if current >= limit:
+        raise AppException(
+            status_code=429,
+            code=1004,
+            message='task concurrency limit reached',
+            data={'limit': limit, 'current': current},
+        )
+
+
 def create_task(
     db: Session,
     *,
@@ -136,6 +168,7 @@ def create_task(
         raise AppException(status_code=400, code=1001, message='invalid detail_level')
 
     _check_create_task_rate_limit(user_id)
+    _check_create_task_concurrency_limit(db, user_id)
 
     _validate_task_files(
         db,

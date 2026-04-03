@@ -18,6 +18,17 @@ class UploadUrlData(BaseSchema):
     headers: dict[str, str]
 
 
+class UploadConstraintItemData(BaseSchema):
+    allowed_ext: list[str]
+    max_file_size_mb: int
+    max_pages: int
+
+
+class UploadConstraintsData(BaseSchema):
+    pdf: UploadConstraintItemData
+    reference_ppt: UploadConstraintItemData
+
+
 class CompleteUploadRequest(BaseModel):
     file_id: int
     checksum_sha256: str | None = None

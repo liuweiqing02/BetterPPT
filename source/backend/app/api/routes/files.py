@@ -9,18 +9,34 @@ from app.core.errors import AppException
 from app.core.security import CurrentUser
 from app.db.session import get_db
 from app.schemas.common import APIResponse
-from app.schemas.file import CompleteUploadRequest, FileData, FileDeleteData, UploadUrlData, UploadUrlRequest
+from app.schemas.file import (
+    CompleteUploadRequest,
+    FileData,
+    FileDeleteData,
+    UploadConstraintsData,
+    UploadUrlData,
+    UploadUrlRequest,
+)
 from app.services.file_service import (
     complete_upload,
     verify_download_signature,
     delete_file,
     create_upload_slot,
+    get_upload_constraints,
     get_file_by_id,
     open_local_file,
     save_uploaded_bytes,
 )
 
 router = APIRouter(prefix='/files', tags=['files'])
+
+
+@router.get('/upload-constraints', response_model=APIResponse)
+def get_upload_constraints_view(
+    current_user: CurrentUser = Depends(get_current_user),
+) -> APIResponse:
+    _ = current_user
+    return APIResponse(data=UploadConstraintsData.model_validate(get_upload_constraints()))
 
 
 @router.post('/upload-url', response_model=APIResponse)

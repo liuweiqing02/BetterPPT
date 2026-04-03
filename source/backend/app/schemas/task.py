@@ -25,6 +25,8 @@ class TaskSummary(BaseSchema):
     status: str
     current_step: str | None = None
     progress: int
+    fallback_state: str = 'none'
+    fallback_attempt_no: int | None = None
     detail_level: str
     rag_enabled: bool = False
     user_prompt: str | None = None

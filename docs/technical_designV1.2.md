@@ -296,10 +296,11 @@ ALTER TABLE task_steps
 
 V1.2 新增：
 
-11. `GET /tasks/{task_no}/quality-report`
-12. `GET /tasks/{task_no}/mappings`
-13. `POST /templates/{file_id}/assetize`（可选预热）
-14. `GET /templates/{file_id}/assets`
+11. `GET /files/upload-constraints`
+12. `GET /tasks/{task_no}/quality-report`
+13. `GET /tasks/{task_no}/mappings`
+14. `POST /templates/{file_id}/assetize`（可选预热）
+15. `GET /templates/{file_id}/assets`
 
 ## 4.3 关键接口增量定义（V1.2）
 
@@ -332,7 +333,33 @@ V1.2 新增：
 }
 ```
 
-### 4.3.2 查询质量报告
+### 4.3.2 获取上传限制配置（补齐前端前置校验契约）
+
+- `GET /api/v1/files/upload-constraints`
+- 用途：下发文件大小、类型、页数等限制，前端据此做前置拦截。
+
+响应示例：
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "pdf": {
+      "allowed_ext": ["pdf"],
+      "max_file_size_mb": 100,
+      "max_pages": 300
+    },
+    "reference_ppt": {
+      "allowed_ext": ["ppt", "pptx"],
+      "max_file_size_mb": 100,
+      "max_pages": 200
+    }
+  }
+}
+```
+
+### 4.3.3 查询质量报告
 
 - `GET /api/v1/tasks/{task_no}/quality-report`
 
@@ -361,7 +388,7 @@ V1.2 新增：
 }
 ```
 
-### 4.3.3 查询页面与槽位映射
+### 4.3.4 查询页面与槽位映射
 
 - `GET /api/v1/tasks/{task_no}/mappings?attempt_no=latest&cursor=<opaque>&limit=100`
 - 参数约束：
@@ -394,13 +421,28 @@ V1.2 新增：
 }
 ```
 
-### 4.3.4 模板资产预热
+### 4.3.5 模板资产预热
 
 - `POST /api/v1/templates/{file_id}/assetize`
 
 用途：提前构建模板资产，降低任务首次生成延时。
 
-### 4.3.5 质量指标计算口径（V1.2.2）
+### 4.3.6 任务详情扩展字段（回退状态判定）
+
+- `GET /api/v1/tasks/{task_no}` 在 V1.2.4 起新增：
+  - `fallback_state`：`none|running|succeeded|failed`
+  - `fallback_attempt_no`：当前或最近一次回退尝试编号
+- 后端计算规则（稳定字段来源）：
+  - 读取 `task_events` 最近一次 `event_type in (fallback_started,fallback_finished,fallback_failed)`。
+  - `fallback_started` -> `fallback_state=running`
+  - `fallback_finished` -> `fallback_state=succeeded`
+  - `fallback_failed` -> `fallback_state=failed`
+  - 无回退事件 -> `fallback_state=none`
+- UI 规则：
+  - 当 `fallback_state=running` 时展示“回退中”。
+  - 当 `fallback_state in (succeeded,failed)` 或任务终态时隐藏“回退中”。
+
+### 4.3.7 质量指标计算口径（V1.2.2）
 
 - 指标版本：`metric_version`，默认 `v1.0`，后续口径调整必须升级版本号。
 - 统计粒度：
@@ -554,9 +596,99 @@ V1.2 新增：
   3. 异步清理对象存储与缓存。
   4. 记录删除审计日志与完成时间。
 
-## 8. 开发落地建议
+## 8. 用户端界面与交互技术设计（V1.2.3）
 
-## 8.1 目录建议
+## 8.1 页面范围与路由（MVP）
+
+- 页面与路由建议：
+  - `GET /app/tasks/new`：任务创建页
+  - `GET /app/tasks`：任务列表页
+  - `GET /app/tasks/{task_no}`：任务详情页（进度 + 日志）
+  - `GET /app/tasks/{task_no}/preview`：结果预览与下载页
+- 失败重试入口：
+  - 列表页行内操作：`POST /api/v1/tasks/{task_no}/retry`
+  - 详情页主操作：`POST /api/v1/tasks/{task_no}/retry`
+- 路由隔离原则：
+  - 前端页面路由统一 ` /app/*` 前缀。
+  - 后端 API 统一 `/api/v1/*` 前缀。
+  - 网关必须按前缀分流，避免页面路由与 API 同名冲突。
+- 页面状态机（前端）：
+  - 创建页：`idle -> validating -> uploading -> submitting -> submitted`
+  - 详情页：`loading -> polling -> succeeded|failed|canceled`
+
+## 8.2 交互实现要求
+
+- 表单校验（前端 + 后端一致）：
+  - 必填：`source_file_id`、`reference_file_id`、`detail_level`
+  - 文件格式：PDF、PPT/PPTX
+  - 文件大小：使用 `GET /api/v1/files/upload-constraints` 返回配置做前置拦截
+  - 提交按钮策略：任一必填不满足时禁用
+- 上传进度：
+  - 单文件上传进度条：0-100%
+  - 双文件总进度：按文件大小加权
+  - 上传失败允许单文件重传，不清空另一文件状态
+- 轮询与状态提示：
+  - 轮询接口：`GET /api/v1/tasks/{task_no}` + `GET /api/v1/tasks/{task_no}/events`
+  - 默认间隔：3 秒；连续 10 次无变化后退避到 5 秒
+  - 停止条件：`succeeded|failed|canceled` 或页面卸载
+  - 状态文案：
+    - `validating`：正在校验输入
+    - `running`：正在生成
+    - `running+self_correct`：正在自动修正版面
+    - `fallback_state=running`：正在执行回退策略
+- 失败可恢复：
+  - `failed` 状态展示重试按钮、失败码、失败说明
+  - 展示 `retry_count` 与最近一次失败时间
+  - 重试后保留历史日志，新增 attempt 视图
+- 空状态与错误提示文案（前端统一常量）：
+  - 任务列表空：`暂无任务，上传 PDF 和参考 PPT 开始生成。`
+  - 预览空：`结果尚未生成，请稍后刷新。`
+  - 网络错误：`网络异常，请检查后重试。`
+  - 系统繁忙：`系统繁忙，请稍后再试。`
+
+## 8.3 前端数据模型与接口映射
+
+- 前端核心状态结构：
+  - `taskSummary`: `task_no/status/detail_level/created_at/updated_at`
+  - `taskDetail`: `current_step/progress/error_code/error_message/retry_count/fallback_state/fallback_attempt_no`
+  - `taskEvents`: `event_type/event_time/message/payload_json`
+  - `previewData`: `slides[]/expires_in`
+- 接口映射：
+  - 上传限制：`GET /api/v1/files/upload-constraints`
+  - 创建任务：`POST /api/v1/tasks`
+  - 列表：`GET /api/v1/tasks`
+  - 详情：`GET /api/v1/tasks/{task_no}`
+  - 日志：`GET /api/v1/tasks/{task_no}/events`
+  - 预览：`GET /api/v1/tasks/{task_no}/preview`
+  - 下载：`GET /api/v1/tasks/{task_no}/result`
+  - 重试：`POST /api/v1/tasks/{task_no}/retry`
+- 预览权限与状态：
+  - 仅 `succeeded` 可调用预览接口
+  - `403/404/409` 需映射到可读提示并引导返回任务详情
+
+## 8.4 体验与性能技术指标（桌面端）
+
+- 桌面适配：
+  - 设计基线宽度：`1366px`
+  - 最低支持：`1280x720`
+  - 目标支持：`1366x768`、`1920x1080`
+- 首屏与关键操作响应（前端埋点口径）：
+  - 创建页首屏可交互时间（TTI）P95 <= 2.0 秒
+  - 提交任务到返回受理结果 P95 <= 1.5 秒
+  - 列表/详情切换响应 P95 <= 1.0 秒
+  - 预览页首批缩略图可见 P95 <= 2.5 秒（任务已成功）
+- 统计口径与采样条件：
+  - 统计窗口：自然周滚动统计，发布后首周可日级观察。
+  - 样本量下限：单指标有效样本 `N >= 200`。
+  - 冷/热启动分开统计：SLA 以热启动指标为准，冷启动单独报表。
+  - 弱网排除：`effectiveType=2g/slow-2g` 或网络错误样本不纳入 SLA 汇总。
+- 监控与告警：
+  - 埋点事件：`page_view`、`task_submit`、`task_poll_tick`、`retry_click`、`preview_loaded`
+  - 连续 5 分钟 P95 超阈值触发前端性能告警
+
+## 9. 开发落地建议
+
+## 9.1 目录建议
 
 - `source/backend/app/api`
 - `source/backend/app/services`
@@ -567,7 +699,7 @@ V1.2 新增：
 - `source/frontend/src/pages`
 - `source/frontend/src/services`
 
-## 8.2 MVP 实施顺序（V1.2）
+## 9.2 MVP 实施顺序（V1.2）
 
 1. 增加模板资产化表与迁移脚本。
 2. 实现 `assetize_template` 与 `map_slots` 步骤。

@@ -3,121 +3,139 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BetterPPT M4 Visual Demo</title>
+  <title>BetterPPT 控制台</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <main class="container">
-    <h1>BetterPPT 联调页</h1>
+    <header class="app-header card">
+      <div>
+        <h1>BetterPPT 用户端</h1>
+        <p class="hint">MVP 页面：创建 / 列表 / 详情 / 预览下载（含失败重试入口）</p>
+      </div>
+      <nav class="app-nav" id="appNav">
+        <button type="button" class="secondary" data-route="/app/create">任务创建</button>
+        <button type="button" class="secondary" data-route="/app/tasks">任务列表</button>
+        <button type="button" class="secondary" data-route="/app/detail">任务详情</button>
+        <button type="button" class="secondary" data-route="/app/result">预览下载</button>
+        <a class="secondary nav-link" href="./legacy.html">联调旧版页面</a>
+      </nav>
+      <div class="route-state">
+        <span class="hint" id="routeStatus"></span>
+      </div>
+    </header>
 
     <section class="card">
-      <h2>1. 上传文件</h2>
-      <div class="row">
-        <label>源 PDF</label>
-        <input id="pdfFile" type="file" accept=".pdf,application/pdf" />
-      </div>
-      <div class="row">
-        <label>参考 PPT</label>
-        <input id="pptFile" type="file" accept=".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation" />
-      </div>
-      <button id="uploadBtn">上传并完成回调</button>
-      <p id="uploadStatus" class="hint"></p>
-    </section>
-
-    <section class="card">
-      <h2>2. 创建任务</h2>
-      <div class="row">
-        <label>长度档位</label>
-        <select id="detailLevel">
-          <option value="concise">concise</option>
-          <option value="balanced" selected>balanced</option>
-          <option value="detailed">detailed</option>
-        </select>
-      </div>
-      <div class="row">
-        <label>提示词</label>
-        <input id="prompt" type="text" placeholder="可选：强调市场规模与竞品对比" />
-      </div>
       <div class="row row-inline">
-        <label>启用 RAG</label>
-        <input id="ragEnabled" type="checkbox" />
+        <label for="taskNoInput">当前 task_no</label>
+        <input id="taskNoInput" type="text" placeholder="创建后自动填充，也可手动输入" />
       </div>
-      <button id="createTaskBtn">创建任务</button>
-      <p id="taskCreateStatus" class="hint"></p>
+      <p id="taskOperationStatus" class="hint task-operation-status"></p>
     </section>
 
-    <section class="card">
-      <h2>3. 任务列表</h2>
-      <div class="toolbar">
-        <button id="refreshTaskListBtn">刷新列表</button>
-        <span id="taskListStatus" class="hint"></span>
-      </div>
-      <div id="taskListPanel" class="task-list"></div>
-    </section>
-
-    <section class="card">
-      <h2>4. 任务状态</h2>
-      <div class="row">
-        <label>task_no</label>
-        <input id="taskNoInput" type="text" placeholder="创建后自动填充" />
-      </div>
-      <div class="action-row">
-        <button id="refreshTaskBtn">查询任务</button>
-        <button id="pollTaskBtn">开始轮询</button>
-        <button id="stopPollBtn">停止轮询</button>
-      </div>
-      <div class="task-operation">
-        <div class="task-operation-header">
-          <h3>任务操作</h3>
-          <span class="hint">支持对当前 task_no 执行取消或重试。</span>
+    <section id="viewCreate" class="app-view">
+      <section class="card">
+        <h2>任务创建页</h2>
+        <div class="row">
+          <label>源 PDF</label>
+          <input id="pdfFile" type="file" accept=".pdf,application/pdf" />
         </div>
+        <div class="row">
+          <label>参考 PPT</label>
+          <input id="pptFile" type="file" accept=".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation" />
+        </div>
+        <button id="uploadBtn">上传文件</button>
+        <p id="uploadStatus" class="hint"></p>
+      </section>
+
+      <section class="card">
+        <h2>创建生成任务</h2>
+        <div class="row">
+          <label>长度档位</label>
+          <select id="detailLevel">
+            <option value="concise">concise</option>
+            <option value="balanced" selected>balanced</option>
+            <option value="detailed">detailed</option>
+          </select>
+        </div>
+        <div class="row">
+          <label>提示词（可选）</label>
+          <input id="prompt" type="text" placeholder="例如：强调市场规模、竞品对比与行动建议" />
+        </div>
+        <div class="row row-inline">
+          <label>启用 RAG</label>
+          <input id="ragEnabled" type="checkbox" />
+        </div>
+        <button id="createTaskBtn">创建任务</button>
+        <p id="taskCreateStatus" class="hint"></p>
+      </section>
+    </section>
+
+    <section id="viewTasks" class="app-view hidden">
+      <section class="card">
+        <h2>任务列表页</h2>
+        <div class="toolbar">
+          <button id="refreshTaskListBtn">刷新列表</button>
+          <span id="taskListStatus" class="hint"></span>
+        </div>
+        <div id="taskListPanel" class="task-list"></div>
+      </section>
+
+      <section class="card">
+        <h2>指标看板</h2>
+        <div class="toolbar">
+          <label for="metricsDaysInput">统计天数</label>
+          <input id="metricsDaysInput" type="number" min="1" max="365" value="7" />
+          <button id="metricsRefreshBtn">刷新指标</button>
+          <span id="metricsStatus" class="hint"></span>
+        </div>
+        <div id="metricsPanel"></div>
+      </section>
+    </section>
+
+    <section id="viewDetail" class="app-view hidden">
+      <section class="card">
+        <h2>任务详情页（进度 + 日志）</h2>
         <div class="action-row">
+          <button id="refreshTaskBtn">查询任务</button>
+          <button id="pollTaskBtn">开始轮询</button>
+          <button id="stopPollBtn">停止轮询</button>
           <button id="cancelTaskBtn" class="secondary">取消任务</button>
           <button id="retryTaskBtn" class="secondary">重试任务</button>
         </div>
-        <p id="taskOperationStatus" class="hint task-operation-status"></p>
-      </div>
-      <div id="taskDetail" class="task-detail"></div>
+        <div id="taskDetail" class="task-detail"></div>
+      </section>
+
+      <section class="card">
+        <h2>任务回放</h2>
+        <div class="toolbar">
+          <button id="replayRefreshBtn">刷新回放</button>
+          <span id="replayStatus" class="hint"></span>
+        </div>
+        <div id="replayPanel" class="task-detail"></div>
+      </section>
+
+      <section class="card">
+        <h2>可观测面板</h2>
+        <div class="toolbar">
+          <button id="observabilityRefreshBtn">刷新可观测数据</button>
+          <span id="observabilityStatus" class="hint"></span>
+        </div>
+        <div id="observabilityPanel"></div>
+      </section>
     </section>
 
-    <section class="card">
-      <h2>5. 结果预览与下载</h2>
-      <div class="action-row">
-        <button id="previewBtn">获取预览</button>
-        <button id="resultBtn">获取下载链接</button>
-      </div>
-      <p id="previewStatus" class="hint"></p>
-      <div id="previewPanel"></div>
-      <p id="downloadLink"></p>
-    </section>
-
-    <section class="card">
-      <h2>6. 任务回放</h2>
-      <div class="toolbar">
-        <button id="replayRefreshBtn">刷新回放</button>
-        <span id="replayStatus" class="hint"></span>
-      </div>
-      <div id="replayPanel" class="task-detail"></div>
-    </section>
-
-    <section class="card">
-      <h2>7. 指标看板</h2>
-      <div class="toolbar">
-        <label for="metricsDaysInput">统计天数</label>
-        <input id="metricsDaysInput" type="number" min="1" max="365" value="7" />
-        <button id="metricsRefreshBtn">刷新指标</button>
-        <span id="metricsStatus" class="hint"></span>
-      </div>
-      <div id="metricsPanel"></div>
-    </section>
-
-    <section class="card">
-      <h2>8. 可观测面板（阶段 3）</h2>
-      <div class="toolbar">
-        <button id="observabilityRefreshBtn">刷新可观测数据</button>
-        <span id="observabilityStatus" class="hint"></span>
-      </div>
-      <div id="observabilityPanel"></div>
+    <section id="viewResult" class="app-view hidden">
+      <section class="card">
+        <h2>结果预览与下载页</h2>
+        <div class="action-row">
+          <button id="previewBtn">获取预览</button>
+          <button id="resultBtn">获取下载链接</button>
+        </div>
+        <p id="previewStatus" class="hint"></p>
+        <div id="previewPanel"></div>
+        <p id="downloadLink"></p>
+      </section>
     </section>
   </main>
 

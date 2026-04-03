@@ -107,6 +107,10 @@ python -m http.server 5173
 | `LLM_MODEL` | 模型名 | 是 |
 | `LLM_REQUEST_TIMEOUT_SECONDS` | 单次 LLM 请求超时（秒） | 否 |
 | `LLM_REQUEST_MAX_RETRIES` | LLM 请求最大重试次数 | 否 |
+| `UPLOAD_PDF_MAX_FILE_SIZE_MB` | PDF 上传大小上限（MB） | 否 |
+| `UPLOAD_REFERENCE_PPT_MAX_FILE_SIZE_MB` | 参考 PPT 上传大小上限（MB） | 否 |
+| `TASK_CONCURRENCY_PER_USER` | 单用户并发任务阈值 | 否 |
+| `TASK_CONCURRENCY_ACTIVE_WINDOW_MINUTES` | 并发活跃窗口（分钟，过滤历史僵尸任务） | 否 |
 | `BETTERPPT_TEMPLATE_VISION_MODEL_PATH` | 本地 Vision 模型目录（离线优先） | 否 |
 | `BETTERPPT_TEMPLATE_VISION_CACHE_DIR` | 本地 HF 缓存目录 | 否 |
 | `LOCAL_STORAGE_ROOT` | 本地存储根目录 | 否 |
